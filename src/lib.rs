@@ -26,18 +26,18 @@ struct RawEvent(AtomicBool); // true for set, false for unset
 #[derive(Clone, Debug, PartialEq)]
 pub enum State {
     /// The event is available and call(s) to [`Event::wait()`] will go through without
-    /// blocking.
+    /// blocking, i.e. the event is signalled.
     Set,
     /// The event is unavailable and calls to [`Event::wait()`] will block until the event
-    /// becomes set.
+    /// becomes set, i.e. the event is unsignalled.
     Unset,
 }
 
 /// An `Event` is a synchronization primitive that is functionally the equivalent of an (optionally
 /// gated) waitable boolean that allows for synchronization between threads. Unlike mutexes and
 /// condition variables which are most often used to restrict access to a critical section, events
-/// are more appropriate for signalling remote threads or waiting on a remote thread to change
-/// state.
+/// are more appropriate for efficiently signalling remote threads or waiting on a remote thread to
+/// change state.
 pub trait Event {
     fn new(initial_state: State) -> Self;
     /// Signal that the event has been set. Depending on the type of event, this may allow one or
@@ -45,7 +45,7 @@ pub trait Event {
     /// [`ManualResetEvent::set()`] for type-specific details.
     fn set(&self);
     /// Set the state of the internal event to [`State::Unset`], regardless of its current status.
-    fn unset(&self);
+    fn reset(&self);
     /// Check if the event has been signalled, and if not, block waiting for it to be set.
     fn wait(&self);
     /// Check if the event has been signalled, and if not, block for `limit` waiting for it to be set.
@@ -91,8 +91,8 @@ impl Event for AutoResetEvent {
     }
 
     /// Set the state of the internal event to [`State::Unset`], regardless of its current status.
-    fn unset(&self) {
-        self.event.unset()
+    fn reset(&self) {
+        self.event.reset()
     }
 
     /// Check if the event has been signalled, and if not, block waiting for it to be set. When the
@@ -131,7 +131,7 @@ impl Event for AutoResetEvent {
 /// Unlike an `AutoResetEvent` which atomically allows one and only one waiter through
 /// each time the underlying `[RawEvent]` is set, a `ManualResetEvent` unparks all past waiters and
 /// allows all future waiters calling [`Event::wait()`] to continue without blocking (until
-/// [`ManualResetEvent::unset()`] is called).
+/// [`ManualResetEvent::reset()`] is called).
 ///
 /// A `ManualResetEvent` is rarely appropriate for general purpose thread synchronization (à la
 /// condition variables and mutexes), where exclusive access to a protected critical section is
@@ -158,8 +158,8 @@ impl ManualResetEvent {
     }
 
     /// Set the state of the internal event to [`State::Unset`], regardless of its current status.
-    fn unset(&self) {
-        self.event.unset()
+    fn reset(&self) {
+        self.event.reset()
     }
 
     /// Check if the underlying event is in a set state or wait for its state to become
@@ -270,8 +270,8 @@ impl RawEvent {
         }
     }
 
-    /// Put the event in a locked (unset) state.
-    fn unset(&self) {
+    /// Put the event in a locked (reset) state.
+    fn reset(&self) {
         self.0.store(false, Ordering::Release);
     }
 
@@ -327,7 +327,7 @@ fn basic_locking() {
 #[test]
 fn basic_unlocking() {
     let event = RawEvent::new(true);
-    event.unset();
+    event.reset();
     assert_eq!(false, event.try_unlock_one());
 }
 
