@@ -1,13 +1,14 @@
 extern crate parking_lot_core;
 
 use parking_lot_core as plc;
-use parking_lot_core::UnparkResult;
+use parking_lot_core::{ParkResult, UnparkResult};
 use std::sync::atomic::{AtomicBool, Ordering, ATOMIC_BOOL_INIT};
+use std::time::{Duration, Instant};
 
 #[cfg(test)]
-use std::thread::{spawn, Thread};
-#[cfg(test)]
 use std::sync::Arc;
+#[cfg(test)]
+use std::thread;
 
 struct RawEvent(AtomicBool); // true for set, false for unset
 
@@ -25,8 +26,13 @@ pub trait Event {
     fn new(initial_state: State) -> Self;
     fn set(&self);
     fn unset(&self);
-    fn unlock(&self);
-    fn try_unlock(&self) -> bool;
+    fn wait(&self);
+    fn wait_for(&self, limit: Duration) -> bool;
+
+    /// Test if an `Event` is available without blocking, return `false` immediately if it is not
+    /// set. Note that this is NOT the same as calling [`Event::wait_for()`] with a `Duration` of
+    /// zero, as the calling thread never yields.
+    fn wait0(&self) -> bool;
 }
 
 pub struct AutoResetEvent {
@@ -50,11 +56,15 @@ impl Event for AutoResetEvent {
         self.event.unset()
     }
 
-    fn unlock(&self) {
+    fn wait(&self) {
         self.event.unlock_one()
     }
 
-    fn try_unlock(&self) -> bool {
+    fn wait_for(&self, limit: Duration) -> bool {
+        self.event.wait_one_for(limit)
+    }
+
+    fn wait0(&self) -> bool {
         self.event.try_unlock_one()
     }
 }
@@ -80,11 +90,15 @@ impl ManualResetEvent {
         self.event.unset()
     }
 
-    fn unlock(&self) {
+    fn wait(&self) {
         self.event.unlock_all()
     }
 
-    fn try_unlock(&self) -> bool {
+    fn wait_for(&self, limit: Duration) -> bool {
+        self.event.wait_all_for(limit)
+    }
+
+    fn wait0(&self) -> bool {
         self.event.try_unlock_all()
     }
 }
@@ -97,7 +111,7 @@ impl RawEvent {
     }
 
     /// Blocks until the event is acquired.
-    fn unlock(&self) {}
+    fn wait(&self) {}
 
     /// Parks the calling thread until the underlying event has unlocked
     unsafe fn suspend_one(&self) {
@@ -174,10 +188,42 @@ impl RawEvent {
     fn unset(&self) {
         self.0.store(false, Ordering::Release);
     }
+
+    fn wait_one_for(&self, limit: Duration) -> bool {
+        let end = Instant::now() + limit;
+        let wait_result = unsafe {
+            plc::park(
+                self as *const RawEvent as usize,
+                || !self.try_unlock_one(),
+                || {},
+                |_, _| {},
+                plc::DEFAULT_PARK_TOKEN,
+                Some(end),
+            )
+        };
+
+        wait_result != ParkResult::TimedOut
+    }
+
+    fn wait_all_for(&self, limit: Duration) -> bool {
+        let end = Instant::now() + limit;
+        let wait_result = unsafe {
+            plc::park(
+                self as *const RawEvent as usize,
+                || !self.try_unlock_all(),
+                || {},
+                |_, _| {},
+                plc::DEFAULT_PARK_TOKEN,
+                Some(end),
+            )
+        };
+
+        wait_result != ParkResult::TimedOut
+    }
 }
 
 #[test]
-fn try_lock_sanity_check() {
+fn sanity_check() {
     let event = RawEvent::new(true);
     assert_eq!(true, event.try_unlock_one());
 
@@ -202,12 +248,12 @@ fn basic_unlocking() {
 #[test]
 fn basic_double_unlock() {
     let event = AutoResetEvent::new(State::Set);
-    assert_eq!(true, event.try_unlock());
-    assert_eq!(false, event.try_unlock());
+    assert_eq!(true, event.wait0());
+    assert_eq!(false, event.wait0());
 
     let event = ManualResetEvent::new(State::Set);
-    assert_eq!(true, event.try_unlock());
-    assert_eq!(true, event.try_unlock());
+    assert_eq!(true, event.wait0());
+    assert_eq!(true, event.wait0());
 }
 
 #[test]
@@ -219,14 +265,14 @@ fn suspend_and_resume() {
     let thread = {
         let event1 = event1.clone();
         let event2 = event2.clone();
-        spawn(move || {
-            assert_eq!(false, event1.try_unlock());
+        thread::spawn(move || {
+            assert_eq!(false, event1.wait0());
             // signal to the first event that we are ready for event1 to be unlocked
             event2.set();
-            event1.unlock();
+            event1.wait();
         })
     };
-    event2.unlock();
+    event2.wait();
     event1.set();
     thread.join();
 }
@@ -234,7 +280,7 @@ fn suspend_and_resume() {
 #[test]
 /// Verify that when a thread is unlocked only one waiting thread gets through.
 fn single_thread_release() {
-    use std::sync::atomic::{AtomicUsize, ATOMIC_USIZE_INIT};
+    use std::sync::atomic::ATOMIC_USIZE_INIT;
 
     let event = Arc::new(AutoResetEvent::new(State::Unset));
     let event2 = Arc::new(AutoResetEvent::new(State::Unset)); // used to signal that a waiter has finished
@@ -245,8 +291,8 @@ fn single_thread_release() {
         let event = event.clone();
         let event2 = event2.clone();
         let succeed_count = succeed_count.clone();
-        spawn(move || {
-            event.unlock();
+        thread::spawn(move || {
+            event.wait();
             succeed_count.fetch_add(1, Ordering::AcqRel);
             event2.set();
         })
@@ -265,9 +311,9 @@ fn single_thread_release() {
         std::thread::yield_now();
     }
 
-    event2.unlock();
+    event2.wait();
     assert_eq!(succeed_count.load(Ordering::Acquire), 1);
     event.set();
-    event2.unlock();
+    event2.wait();
     assert_eq!(succeed_count.load(Ordering::Acquire), 2);
 }
