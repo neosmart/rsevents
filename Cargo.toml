@@ -1,0 +1,7 @@
+[package]
+name = "rsevents"
+version = "0.1.0"
+authors = ["Mahmoud Al-Qudsi <mqudsi@neosmart.net>"]
+
+[dependencies]
+parking_lot_core = "0.3"
