@@ -1,3 +1,12 @@
+//! `rsevents` is an implementation of WIN32's auto- and manual-reset events for the rust world.
+//! Events are synchronization primitives (i.e. not implemented atop of mutexes) used to either
+//! create other synchronization primitives with or for implementing signalling between threads.
+//!
+//! Events come in two different flavors: [`AutoResetEvent`] and [`ManualResetEvent`], both
+//! implementing the [`Event`] trait for abstracting over the underlying event type. Internally,
+//! both are implemented with the unsafe [`RawEvent`] and use the `parking_lot_core` crate to
+//! take care of efficiently suspending (parking) threads while they wait for an event to become
+//! signalled.
 extern crate parking_lot_core;
 
 use parking_lot_core as plc;
@@ -12,34 +21,63 @@ use std::thread;
 
 struct RawEvent(AtomicBool); // true for set, false for unset
 
+/// A representation of the state of an `[Event]`, which can either be `Set` (i.e. signalled,
+/// ready) or `Unset` (i.e. not ready).
 #[derive(Clone, Debug, PartialEq)]
 pub enum State {
-    /// The event is available and call(s) to [`RawEvent::unlock()`] will go through without
+    /// The event is available and call(s) to [`Event::wait()`] will go through without
     /// blocking.
     Set,
-    /// The event is unavailable and calls to [`RawEvent::unlock()`] will block until the event
+    /// The event is unavailable and calls to [`Event::wait()`] will block until the event
     /// becomes set.
     Unset,
 }
 
+/// An `Event` is a synchronization primitive that is functionally the equivalent of an (optionally
+/// gated) waitable boolean that allows for synchronization between threads. Unlike mutexes and
+/// condition variables which are most often used to restrict access to a critical section, events
+/// are more appropriate for signalling remote threads or waiting on a remote thread to change
+/// state.
 pub trait Event {
     fn new(initial_state: State) -> Self;
+    /// Signal that the event has been set. Depending on the type of event, this may allow one or
+    /// more parked or future waiters through. See [`AutoResetEvent::set()`] and
+    /// [`ManualResetEvent::set()`] for type-specific details.
     fn set(&self);
+    /// Set the state of the internal event to [`State::Unset`], regardless of its current status.
     fn unset(&self);
+    /// Check if the event has been signalled, and if not, block waiting for it to be set.
     fn wait(&self);
+    /// Check if the event has been signalled, and if not, block for `limit` waiting for it to be set.
+    /// Returns `true` if the event was originally set or if it was signalled within the specified
+    /// duration, and `false` otherwise (if the timeout elapsed without the event becoming set).
     fn wait_for(&self, limit: Duration) -> bool;
 
     /// Test if an `Event` is available without blocking, return `false` immediately if it is not
-    /// set. Note that this is NOT the same as calling [`Event::wait_for()`] with a `Duration` of
+    /// set. Note that this is *not* the same as calling [`Event::wait_for()`] with a `Duration` of
     /// zero, as the calling thread never yields.
     fn wait0(&self) -> bool;
 }
 
+/// An `AutoResetEvent` is a gated [`Event`] that is functionally equivalent to a "waitable
+/// boolean" and can be atomically waited upon and consumed to signal one and only one waiter at a
+/// time, thereby guaranteeing exclusive access to a critical section.
+///
+/// While an `AutoResetEvent` can be used to implement mutexes and condition variables, it is more
+/// appropriate for uses involving signalling between two or more threads. Unlike a
+/// `ManualResetEvent`, an `AutoResetEvent`'s `set` state is selectively made visible to only one
+/// waiter at a time (including past waiters currently in a suspended/parked state). When
+/// [`AutoResetEvent::set()`] is called, at most one thread blocked in a call to
+/// [`AutoResetEvent::wait()`] will be let through (hence the "gated" description). If a previously
+/// parked thread was awaked, then the event's state remains unset for all future callers, but if
+/// no threads were previously parked waiting for this event to be signalled then only the next
+/// thread to call `AutoResetEvent::wait()` on this instance will be let through without blocking.
 pub struct AutoResetEvent {
     event: RawEvent,
 }
 
 impl Event for AutoResetEvent {
+    /// Create a new [`AutoResetEvent`] that can be used to atomically signal one waiter at a time.
     fn new(state: State) -> AutoResetEvent {
         Self {
             event: RawEvent::new(state == State::Set),
@@ -52,28 +90,61 @@ impl Event for AutoResetEvent {
         self.event.set_one()
     }
 
+    /// Set the state of the internal event to [`State::Unset`], regardless of its current status.
     fn unset(&self) {
         self.event.unset()
     }
 
+    /// Check if the event has been signalled, and if not, block waiting for it to be set. When the
+    /// event becomes available, its state is atomically set to [`State::Unset`], allowing only
+    /// one waiter through.
     fn wait(&self) {
         self.event.unlock_one()
     }
 
+    /// Check if the event has been signalled, and if not, block for `limit` waiting for it to be set.
+    /// If and when the event becomes available, its state is atomically set to [`State::Unset`],
+    /// allowing only one waiter through.
+    ///
+    /// Returns `true` if the event was originally set or if it was signalled within the specified
+    /// duration, and `false` otherwise (if the timeout elapsed without the event becoming set).
     fn wait_for(&self, limit: Duration) -> bool {
         self.event.wait_one_for(limit)
     }
 
+    /// Test if an `Event` is available without blocking, returning `false` immediately if it is
+    /// not set. **This is _not_ a `peek()` function:** if the event's state was [`State::Set`], it
+    /// is atomically reset to [`State::Unset`].
+    ///
+    /// Note that this is additionally _not_ the same as calling [`Event::wait_for()`] with a
+    /// `Duration` of zero, as the calling thread never yields.
     fn wait0(&self) -> bool {
         self.event.try_unlock_one()
     }
 }
 
+/// A `ManualResetEvent` is an [`Event`] impl best understood as a "waitable boolean" that
+/// efficiently synchronizes thread access to a shared state, allowing one or more threads to wait
+/// for a signal from one or more other threads, where the signal could have either occurred in the
+/// past or could come at any time in the future.
+///
+/// Unlike an `AutoResetEvent` which atomically allows one and only one waiter through
+/// each time the underlying `[RawEvent]` is set, a `ManualResetEvent` unparks all past waiters and
+/// allows all future waiters calling [`Event::wait()`] to continue without blocking (until
+/// [`ManualResetEvent::unset()`] is called).
+///
+/// A `ManualResetEvent` is rarely appropriate for general purpose thread synchronization (à la
+/// condition variables and mutexes), where exclusive access to a protected critical section is
+/// usually desired, as if multiple threads are suspended/parked waiting for the event to be
+/// signalled and then `Event::set()` is called, _all_ of the suspended threads will be unparked
+/// and will resume. However, a `ManualResetEvent` shines when it comes to setting persistent
+/// state indicators, such as a globally-shared abort flag.
 pub struct ManualResetEvent {
     event: RawEvent,
 }
 
 impl ManualResetEvent {
+    /// Create a new [`ManualResetEvent`].
     fn new(state: State) -> ManualResetEvent {
         Self {
             event: RawEvent::new(state == State::Set),
@@ -86,18 +157,33 @@ impl ManualResetEvent {
         self.event.set_all()
     }
 
+    /// Set the state of the internal event to [`State::Unset`], regardless of its current status.
     fn unset(&self) {
         self.event.unset()
     }
 
+    /// Check if the underlying event is in a set state or wait for its state to become
+    /// [`State::Set`]. The event's state is not affected by this operation, i.e. it remains set
+    /// for future callers even after this function call returns.
     fn wait(&self) {
         self.event.unlock_all()
     }
 
+    /// Check if the underlying event is in a set state (and return immediately) or wait for it to
+    /// become set, up to the limit specified by the `Duration` parameter.
+    ///
+    /// Returns `true` if the event was initially set or if it became set within the timelimit
+    /// specified. Otherise returns `false` if the timeout elapsed without the event becoming
+    /// available.
     fn wait_for(&self, limit: Duration) -> bool {
         self.event.wait_all_for(limit)
     }
 
+    /// Test if an `Event` is available without blocking, returning `false` immediately if it is
+    /// not set.
+    ///
+    /// Note that this is NOT the same as calling [`Event::wait_for()`] with a `Duration` of
+    /// zero, as the calling thread never yields.
     fn wait0(&self) -> bool {
         self.event.try_unlock_all()
     }
