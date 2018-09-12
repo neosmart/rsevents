@@ -1,7 +1,15 @@
 [package]
 name = "rsevents"
+description = "Manual and auto reset events for signaling remote threads and building synchronization primitives"
 version = "0.1.0"
-authors = ["Mahmoud Al-Qudsi <mqudsi@neosmart.net>"]
+authors = ["Mahmoud Al-Qudsi <mqudsi@neosmart.net>",
+		"NeoSmart Technologies <https://neosmart.net/>"]
+homepage = "https://github.com/neosmart/rsevents"
+repository = "https://github.com/neosmart/rsevents"
+readme = "README.md"
+keywords = ["synchronization", "events", "signals"]
+categories = ["concurrency", "asynchronous"]
+license = "MIT"
 
 [dependencies]
 parking_lot_core = "0.3"

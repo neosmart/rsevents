@@ -1,6 +1,6 @@
 # rsevents
 
-[![crates.io](https://img.shields.io/crates/v/rsevents.svg)](https://https://crates.io/crates/rsevents)
+[![crates.io](https://img.shields.io/crates/v/rsevents.svg)](https://crates.io/crates/rsevents)
 [![docs.rs](https://docs.rs/rsevents/badge.svg)](https://docs.rs/crate/rsevents)
 
 This crate contains a cross-platform implementation of auto and manual reset events similar to those
@@ -69,5 +69,5 @@ manual- or auto-reset event instead.
 ## About
 
 rsevents is written and maintained by Mahmoud Al-Qudsi \<mqudsi@neosmart.net\> of NeoSmart
-Technologies \<https://neosmart.net/\> and released to the general public under the terms of the MIT
-public license.
+Technologies \<[https://neosmart.net/](https://neosmart.net)> and released to the general public
+under the terms of the MIT public license.
