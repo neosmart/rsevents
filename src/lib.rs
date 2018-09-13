@@ -25,10 +25,10 @@ struct RawEvent(AtomicBool); // true for set, false for unset
 /// ready) or `Unset` (i.e. not ready).
 #[derive(Clone, Debug, PartialEq)]
 pub enum State {
-    /// The event is available and call(s) to [`Event::wait()`] will go through without
+    /// The event is available and call(s) to [`Awaitable::wait()`] will go through without
     /// blocking, i.e. the event is signalled.
     Set,
-    /// The event is unavailable and calls to [`Event::wait()`] will block until the event
+    /// The event is unavailable and calls to [`Awaitable::wait()`] will block until the event
     /// becomes set, i.e. the event is unsignalled.
     Unset,
 }
@@ -39,22 +39,25 @@ pub enum State {
 /// are more appropriate for efficiently signalling remote threads or waiting on a remote thread to
 /// change state.
 pub trait Event {
-    fn new(initial_state: State) -> Self;
     /// Signal that the event has been set. Depending on the type of event, this may allow one or
     /// more parked or future waiters through. See [`AutoResetEvent::set()`] and
     /// [`ManualResetEvent::set()`] for type-specific details.
     fn set(&self);
     /// Set the state of the internal event to [`State::Unset`], regardless of its current status.
     fn reset(&self);
+}
+
+pub trait Awaitable {
     /// Check if the event has been signalled, and if not, block waiting for it to be set.
     fn wait(&self);
+
     /// Check if the event has been signalled, and if not, block for `limit` waiting for it to be set.
     /// Returns `true` if the event was originally set or if it was signalled within the specified
     /// duration, and `false` otherwise (if the timeout elapsed without the event becoming set).
     fn wait_for(&self, limit: Duration) -> bool;
 
     /// Test if an `Event` is available without blocking, return `false` immediately if it is not
-    /// set. Note that this is *not* the same as calling [`Event::wait_for()`] with a `Duration` of
+    /// set. Note that this is *not* the same as calling [`Awaitable::wait_for()`] with a `Duration` of
     /// zero, as the calling thread never yields.
     fn wait0(&self) -> bool;
 }
@@ -76,14 +79,16 @@ pub struct AutoResetEvent {
     event: RawEvent,
 }
 
-impl Event for AutoResetEvent {
+impl AutoResetEvent {
     /// Create a new [`AutoResetEvent`] that can be used to atomically signal one waiter at a time.
-    fn new(state: State) -> AutoResetEvent {
+    pub fn new(state: State) -> AutoResetEvent {
         Self {
             event: RawEvent::new(state == State::Set),
         }
     }
+}
 
+impl Event for AutoResetEvent {
     /// Triggers the underlying [`RawEvent`], either releasing one suspended waiter or allowing one
     /// future caller to exclusively obtain the event.
     fn set(&self) {
@@ -94,7 +99,9 @@ impl Event for AutoResetEvent {
     fn reset(&self) {
         self.event.reset()
     }
+}
 
+impl Awaitable for AutoResetEvent {
     /// Check if the event has been signalled, and if not, block waiting for it to be set. When the
     /// event becomes available, its state is atomically set to [`State::Unset`], allowing only
     /// one waiter through.
@@ -116,7 +123,7 @@ impl Event for AutoResetEvent {
     /// not set. **This is _not_ a `peek()` function:** if the event's state was [`State::Set`], it
     /// is atomically reset to [`State::Unset`].
     ///
-    /// Note that this is additionally _not_ the same as calling [`Event::wait_for()`] with a
+    /// Note that this is additionally _not_ the same as calling [`Awaitable::wait_for()`] with a
     /// `Duration` of zero, as the calling thread never yields.
     fn wait0(&self) -> bool {
         self.event.try_unlock_one()
@@ -130,7 +137,7 @@ impl Event for AutoResetEvent {
 ///
 /// Unlike an `AutoResetEvent` which atomically allows one and only one waiter through
 /// each time the underlying `[RawEvent]` is set, a `ManualResetEvent` unparks all past waiters and
-/// allows all future waiters calling [`Event::wait()`] to continue without blocking (until
+/// allows all future waiters calling [`Awaitable::wait()`] to continue without blocking (until
 /// [`ManualResetEvent::reset()`] is called).
 ///
 /// A `ManualResetEvent` is rarely appropriate for general purpose thread synchronization (à la
@@ -143,14 +150,16 @@ pub struct ManualResetEvent {
     event: RawEvent,
 }
 
-impl Event for ManualResetEvent {
+impl ManualResetEvent {
     /// Create a new [`ManualResetEvent`].
-    fn new(state: State) -> ManualResetEvent {
+    pub fn new(state: State) -> ManualResetEvent {
         Self {
             event: RawEvent::new(state == State::Set),
         }
     }
+}
 
+impl Event for ManualResetEvent {
     /// Puts the underlying [`RawEvent`] into a set state, releasing all suspended waiters (if any)
     /// and leaving the event set for future callers.
     fn set(&self) {
@@ -161,7 +170,9 @@ impl Event for ManualResetEvent {
     fn reset(&self) {
         self.event.reset()
     }
+}
 
+impl Awaitable for ManualResetEvent {
     /// Check if the underlying event is in a set state or wait for its state to become
     /// [`State::Set`]. The event's state is not affected by this operation, i.e. it remains set
     /// for future callers even after this function call returns.
@@ -182,7 +193,7 @@ impl Event for ManualResetEvent {
     /// Test if an `Event` is available without blocking, returning `false` immediately if it is
     /// not set.
     ///
-    /// Note that this is NOT the same as calling [`Event::wait_for()`] with a `Duration` of
+    /// Note that this is NOT the same as calling [`Awaitable::wait_for()`] with a `Duration` of
     /// zero, as the calling thread never yields.
     fn wait0(&self) -> bool {
         self.event.try_unlock_all()
@@ -190,7 +201,7 @@ impl Event for ManualResetEvent {
 }
 
 impl RawEvent {
-    fn new(state: bool) -> RawEvent {
+    pub fn new(state: bool) -> RawEvent {
         let event = RawEvent(ATOMIC_BOOL_INIT);
         event.0.store(state, Ordering::Relaxed);
         event
