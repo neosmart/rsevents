@@ -274,7 +274,7 @@ impl RawEvent {
             // Leave this event unlocked so another thread may obtain it later.  But keep in mind
             // another thread may have obtained the event while we were here, so only set it to
             // `true` if it is currently `false` (as we expect it to be).
-            self.0.compare_and_swap(false, true, Ordering::Relaxed);
+            self.0.compare_and_swap(false, true, Ordering::Release);
         }
     }
 
