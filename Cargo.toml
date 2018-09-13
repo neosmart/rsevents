@@ -1,7 +1,7 @@
 [package]
 name = "rsevents"
 description = "Manual and auto reset events for signaling remote threads and building synchronization primitives"
-version = "0.1.1"
+version = "0.2.0"
 authors = ["Mahmoud Al-Qudsi <mqudsi@neosmart.net>",
 		"NeoSmart Technologies <https://neosmart.net/>"]
 homepage = "https://github.com/neosmart/rsevents"
