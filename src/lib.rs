@@ -66,6 +66,9 @@ pub trait Awaitable {
 /// parked thread was awaked, then the event's state remains unset for all future callers, but if
 /// no threads were previously parked waiting for this event to be signalled then only the next
 /// thread to call `AutoResetEvent::wait()` on this instance will be let through without blocking.
+///
+/// Auto-reset events are thread-safe and may be wrapped in an [`Arc`](std::sync::Arc) to easily
+/// share across threads.
 pub struct AutoResetEvent {
     event: RawEvent,
 }
@@ -135,6 +138,9 @@ impl Awaitable for AutoResetEvent {
 /// signalled and then [`ManualResetEvent::set()`] is called, _all_ of the suspended threads will be
 /// unparked and will resume. However, a `ManualResetEvent` shines when it comes to setting
 /// persistent state indicators, such as a globally-shared abort flag.
+///
+/// Manual-reset events are thread-safe and may be wrapped in an [`Arc`](std::sync::Arc) to easily
+/// share across threads.
 pub struct ManualResetEvent {
     event: RawEvent,
 }
