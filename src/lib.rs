@@ -10,7 +10,7 @@
 extern crate parking_lot_core;
 
 use parking_lot_core as plc;
-use parking_lot_core::{ParkResult, UnparkResult};
+use parking_lot_core::ParkResult;
 use std::sync::atomic::{AtomicBool, Ordering, ATOMIC_BOOL_INIT};
 use std::time::{Duration, Instant};
 
@@ -143,7 +143,7 @@ pub struct ManualResetEvent {
     event: RawEvent,
 }
 
-impl ManualResetEvent {
+impl Event for ManualResetEvent {
     /// Create a new [`ManualResetEvent`].
     fn new(state: State) -> ManualResetEvent {
         Self {
@@ -195,9 +195,6 @@ impl RawEvent {
         event.0.store(state, Ordering::Relaxed);
         event
     }
-
-    /// Blocks until the event is acquired.
-    fn wait(&self) {}
 
     /// Parks the calling thread until the underlying event has unlocked
     unsafe fn suspend_one(&self) {
