@@ -23,7 +23,7 @@ clean:
 	@$(CARGO) clean
 
 doc:
-	@$(CARGO) doc
+	@$(CARGO) doc --document-private-items
 
 install: build
 	@$(CARGO) install
