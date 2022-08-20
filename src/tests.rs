@@ -1,6 +1,6 @@
 use crate::*;
-use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
+use std::sync::Arc;
 use std::thread;
 
 #[test]
