@@ -37,17 +37,19 @@ pub enum State {
 }
 
 pub trait Awaitable {
-    /// Check if the event has been signalled, and if not, block waiting for it to be set.
+    /// Check if the awaitable type is available, and if not, block waiting for it to become
+    /// available.
     fn wait(&self);
 
-    /// Check if the event has been signalled, and if not, block for `limit` waiting for it to be set.
-    /// Returns `true` if the event was originally set or if it was signalled within the specified
-    /// duration, and `false` otherwise (if the timeout elapsed without the event becoming set).
+    /// Check if the awaitable type is available, and if not, block for `limit` waiting for it to
+    /// become available. Returns `true` if the `Awaitable` was originally set or if it became so
+    /// within the specified duration and `false` otherwise (if the timeout elapsed without the
+    /// `Awaitable` becoming set).
     fn wait_for(&self, limit: Duration) -> bool;
 
-    /// Test if an event is available without blocking, return `false` immediately if it is not
-    /// set. Note that this is *not* the same as calling [`Awaitable::wait_for()`] with a `Duration` of
-    /// zero, as the calling thread never yields.
+    /// Test if the awaitable type is available without blocking, return `false` immediately if it
+    /// is not. Note that this is *not* the same as calling [`Awaitable::wait_for()`] with a
+    /// `Duration` of zero, as the calling thread never yields.
     fn wait0(&self) -> bool;
 }
 
