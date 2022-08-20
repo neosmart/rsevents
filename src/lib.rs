@@ -21,7 +21,8 @@ use std::time::{Duration, Instant};
 #[cfg(test)]
 mod tests;
 
-struct RawEvent(AtomicBool); // true for set, false for unset
+/// A wrapper around an atomic state that represents whether or not the event is available.
+struct RawEvent(AtomicBool);
 
 /// A representation of the state of an event, which can either be `Set` (i.e. signalled,
 /// ready) or `Unset` (i.e. not ready).
@@ -60,7 +61,7 @@ pub trait Awaitable {
 /// waiter at a time (including past waiters currently in a suspended/parked state). When
 /// [`AutoResetEvent::set()`] is called, at most one thread blocked in a call to
 /// [`Awaitable::wait()`] will be let through (hence the "gated" description). If a previously
-/// parked thread was awaked, then the event's state remains unset for all future callers, but if
+/// parked thread was awakened, then the event's state remains unset for all future callers, but if
 /// no threads were previously parked waiting for this event to be signalled then only the next
 /// thread to call `AutoResetEvent::wait()` on this instance will be let through without blocking.
 ///
@@ -191,38 +192,15 @@ impl Awaitable for ManualResetEvent {
 }
 
 impl RawEvent {
-    pub fn new(state: bool) -> RawEvent {
-        let event = RawEvent(AtomicBool::new(false));
-        event.0.store(state, Ordering::Relaxed);
-        event
+    pub const fn new(state: bool) -> RawEvent {
+        RawEvent(AtomicBool::new(state))
     }
 
-    /// Parks the calling thread until the underlying event has unlocked
-    unsafe fn suspend_one(&self) {
-        plc::park(
-            self as *const RawEvent as usize,
-            || !self.try_unlock_one(),
-            || {},
-            |_, _| {},
-            plc::DEFAULT_PARK_TOKEN,
-            None,
-        );
-    }
-
-    unsafe fn suspend_all(&self) {
-        plc::park(
-            self as *const RawEvent as usize,
-            || !self.try_unlock_all(),
-            || {},
-            |_, _| {},
-            plc::DEFAULT_PARK_TOKEN,
-            None,
-        );
-    }
-
-    /// Attempts to exclusively obtain the event. Returns true upon success.
+    /// Attempts to exclusively obtain the event. Returns true upon success. Called internally by
+    /// [`suspend_one()`](Self::suspend_one) when determining if a thread should be parked/suspended
+    /// or if that's not necessary.
     fn try_unlock_one(&self) -> bool {
-        self.0.swap(false, Ordering::AcqRel)
+        self.0.swap(false, Ordering::Acquire)
     }
 
     /// Attempts to obtain the event (without locking out future callers). Returns true upon success.
@@ -230,10 +208,71 @@ impl RawEvent {
         self.0.load(Ordering::Acquire)
     }
 
+    /// Parks the calling thread until the underlying event has unlocked. If the event is set during
+    /// this call, the park aborts/returns early so that no event sets are missed. Consumes the
+    /// event's set state in case of early return.
+    unsafe fn suspend_one(&self) {
+        plc::park(
+            self as *const RawEvent as usize, // key for keyed event
+            || !self.try_unlock_one(), // whether or not to go through with the park, run while
+                                       // queue is locked
+            || {}, // callback before parking, run after queue is unlocked
+            |_, _| {}, // timeout handler, run while queue is locked
+            plc::DEFAULT_PARK_TOKEN,
+            None, // timeout
+        );
+    }
+
+    /// Parks the calling thread until the underlying event has unlocked. If the event is set during
+    /// this call, the park aborts/returns early so that no event sets are missed. Unlike
+    /// [`suspend_one()`](Self::suspend_one), does not consume the event's set state in case of
+    /// early return.
+    unsafe fn suspend_all(&self) {
+        plc::park(
+            self as *const RawEvent as usize, // key for keyed event
+            || !self.try_unlock_all(), // whether or not to go through with the park, run while
+                                       // queue is locked
+            || {}, // callback before parking, run after queue is unlocked
+            |_, _| {}, // timeout handler, run while queue is locked
+            plc::DEFAULT_PARK_TOKEN,
+            None, // timeout
+        );
+    }
+
+    /// Trigger the event, releasing one waiter
+    fn set_one(&self) {
+        unsafe {
+            // The unpark callback happens with the plc queue locked, so we guarantee that the logic
+            // here happens either completely before or completely after the logic in the callback
+            // passed to plc::park() in suspend_one().
+            plc::unpark_one(self as *const RawEvent as usize, |unpark_result| {
+                // This has to be done here with the plc queue locked so that a simultaneous call
+                // into plc::park() will not suspend a thread after we've tried unfruitfully to
+                // awaken one but before we've had a chance to set the internal state, causing the
+                // set_one() call to be missed.
+
+                if unpark_result.unparked_threads == 0 {
+                    // Since the wakeup resulted in no threads being unparked, set the state to unlocked to
+                    // ensure that the event isn't missed.
+                    self.0.store(true, Ordering::Release);
+                } else {
+                    // There's no need to guarantee synchronization of code before/after the
+                    // set/wait() call points when the event wasn't available.
+                    self.0.store(false, Ordering::Relaxed);
+                }
+                plc::DEFAULT_UNPARK_TOKEN
+            })
+        };
+    }
+
     /// Trigger the event, releasing all waiters
     fn set_all(&self) {
-        self.0.store(true, Ordering::Release);
-        unsafe { plc::unpark_all(self as *const RawEvent as usize, plc::DEFAULT_UNPARK_TOKEN) };
+        if self.0.swap(true, Ordering::Release) == false {
+            // The event was previously unavailable
+            unsafe {
+                plc::unpark_all(self as *const RawEvent as usize, plc::DEFAULT_UNPARK_TOKEN)
+            };
+        }
     }
 
     fn unlock_one(&self) {
@@ -252,25 +291,11 @@ impl RawEvent {
         }
     }
 
-    /// Trigger the event, releasing one waiter
-    fn set_one(&self) {
-        let unpark_result = unsafe {
-            plc::unpark_one(self as *const RawEvent as usize, |_| {
-                plc::DEFAULT_UNPARK_TOKEN
-            })
-        };
-
-        if unpark_result.unparked_threads == 0 {
-            // Leave this event unlocked so another thread may obtain it later.  But keep in mind
-            // another thread may have obtained the event while we were here, so only set it to
-            // `true` if it is currently `false` (as we expect it to be).
-            self.0.compare_and_swap(false, true, Ordering::Release);
-        }
-    }
-
     /// Put the event in a locked (reset) state.
     fn reset(&self) {
-        self.0.store(false, Ordering::Release);
+        // Calling reset() does not imply any strict ordering of code before or after a matching
+        // (try_)unlock() call, so we use Relaxed semantics.
+        self.0.store(false, Ordering::Relaxed);
     }
 
     fn wait_one_for(&self, limit: Duration) -> bool {
