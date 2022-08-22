@@ -45,19 +45,21 @@ pub enum EventState {
 pub type State = EventState;
 
 pub trait Awaitable {
-    /// Check if the awaitable type is available, and if not, block waiting for it to become
-    /// available.
+    /// Check for and obtain the awaitable type if it is available; if not, block waiting for it to
+    /// become available.
     fn wait(&self);
 
-    /// Check if the awaitable type is available, and if not, block for `limit` waiting for it to
-    /// become available. Returns `true` if the `Awaitable` was originally set or if it became so
-    /// within the specified duration and `false` otherwise (if the timeout elapsed without the
-    /// `Awaitable` becoming set).
+    /// Check for/obtain the awaitable type if it is available, and if not, block for `limit`
+    /// waiting for it to become available.
+    /// Returns `true` if the `Awaitable` was originally set or if it became so within the specified
+    /// duration and `false` otherwise (i.e. if the timeout elapsed without the `Awaitable` type
+    /// becoming set/available).
     fn wait_for(&self, limit: Duration) -> bool;
 
-    /// Test if the awaitable type is available, return `false` if it is not.
-    /// This call may have side effects beyond merely returning the current state and should
-    /// not be considered a `test()` or `peek()` function.
+    /// Attempt to obtain the `Awaitable` type in a potentially lock-free, wait-free manor,
+    /// returning `false` if it's currently unavailable.
+    /// **This call may have side effects beyond merely returning the current state and must
+    /// not be considered the equivalent of a `test()` or `peek()` function.**
     ///
     /// Note that this may not be the same as calling [`Awaitable::wait_for()`] with a `Duration` of
     /// zero, as the implementing type may use a different approach to ensure that the calling
@@ -69,7 +71,7 @@ pub trait Awaitable {
     }
 }
 
-/// An `AutoResetEvent` is a gated event that is functionally equivalent to a "waitable
+/// An `AutoResetEvent` is a gated event that is functionally equivalent to an "awaitable
 /// boolean" and can be atomically waited upon and consumed to signal one and only one waiter at a
 /// time, thereby guaranteeing exclusive signalling. This is not unlike a multi-producer,
 /// multi-consumer non-broadcast `Channel<()>` with a buffer size of 1, except much more efficient
@@ -78,13 +80,18 @@ pub trait Awaitable {
 /// `AutoResetEvent` can be used to implement other synchronization objects such as mutexes and
 /// condition variables, but it is most appropriate for uses involving signalling between two or
 /// more threads. Unlike a [`ManualResetEvent`], an `AutoResetEvent`'s `set` state is selectively
-/// made visible to only one waiter at a time (including past waiters currently in a
-/// suspended/parked state). When [`AutoResetEvent::set()`] is called, at most one thread blocked in
-/// a call to [`Awaitable::wait()`] will be let through (hence the "gated" description). If a
-/// previously parked thread was awakened, then the event's state remains unset for all future
-/// callers, but if no threads were previously parked waiting for this event to be signalled then
-/// only the next thread to call [`AutoResetEvent::wait()`] on this instance will be let through
-/// without blocking (and with the `set()` call returning immediately).
+/// made visible to only one waiter at a time (including both past waiters currently in a
+/// suspended/parked state and future waiters that haven't yet made a call to `Awaitable::wait()` or
+/// similar).
+///
+/// When [`AutoResetEvent::set()`] is called, at most one thread blocked in a call to
+/// [`Awaitable::wait()`] will be let through: if a previously parked thread was awakened, then the
+/// event's state remains unset for all other past/future callers (until another call to
+/// `AutoResetEvent::set()`), but if no threads were previously parked waiting for this event to be
+/// signalled then only the next thread to call [`AutoResetEvent::wait()`] against this instance
+/// will be let through without blocking. Regardless of whether or not there are any threads
+/// currently waiting, the call to `set()` always returns immediately (i.e. it does not block until
+/// another thread attempts to obtain the event).
 ///
 /// Auto-reset events are thread-safe and may be wrapped in an [`Arc`](std::sync::Arc) or declared
 /// as a static global to easily share access across threads.
@@ -115,8 +122,9 @@ impl AutoResetEvent {
 
 impl Awaitable for AutoResetEvent {
     /// Check if the event has been signalled, and if not, block waiting for it to be set. When the
-    /// event becomes available, its state is atomically set to [`EventState::Unset`], allowing only
-    /// one waiter through.
+    /// event becomes available to this thread, its state is atomically set to
+    /// [`EventState::Unset`], allowing only this one waiter through until another call to
+    /// [`AutoResetEvent::set()`] is made.
     fn wait(&self) {
         self.event.unlock_one()
     }
@@ -126,26 +134,27 @@ impl Awaitable for AutoResetEvent {
     /// [`EventState::Unset`], allowing only this one waiter through.
     ///
     /// Returns `true` if the event was originally set or if it was signalled within the specified
-    /// duration, and `false` otherwise (if the timeout elapsed without the event becoming set).
+    /// duration, and `false` otherwise (i.e. the timeout elapsed without the event becoming set).
     fn wait_for(&self, limit: Duration) -> bool {
         self.event.wait_one_for(limit)
     }
 
-    /// Test if an event is available without blocking, returning `false` immediately if it is
-    /// not set. **This is _not_ a `peek()` function:** if the event's state was
-    /// [`EventState::Set`], it is atomically reset to [`EventState::Unset`].
+    /// "Wait" on the `AutoResetEvent` event without blocking, immediately returning `true` if the
+    /// event was signalled for this thread and `false` if it wasn't set.
+    /// **This is _not_ a `peek()` function:** if the event's state was [`EventState::Set`], it is
+    /// atomically reset to [`EventState::Unset`], locking out all other callers.
     ///
-    /// Note that this is additionally _not_ the same as calling [`Awaitable::wait_for()`] with a
-    /// `Duration` of zero, as the calling thread never yields.
+    /// Note that this is similar but not identical to calling [`AutoResetEvent::wait_for()`] with a
+    /// `Duration` of zero, as the calling thread never blocks or yields.
     fn wait0(&self) -> bool {
         self.event.try_unlock_one()
     }
 }
 
-/// A `ManualResetEvent` is an event type best understood as a "waitable boolean" that efficiently
+/// A `ManualResetEvent` is an event type best understood as an "awaitable boolean" that efficiently
 /// synchronizes thread access to a shared state, allowing one or more threads to wait for a signal
-/// from one or more other threads, where the signal could have either occurred in the past or
-/// could come at any time in the future.
+/// from one or more other threads, where the signal could have either occurred in the past or could
+/// come at any time in the future.
 ///
 /// Unlike an [`AutoResetEvent`] which atomically allows one and only one waiter through each time
 /// the underlying `RawEvent` is set, a `ManualResetEvent` unparks all past waiters and allows
@@ -166,7 +175,7 @@ pub struct ManualResetEvent {
 }
 
 impl ManualResetEvent {
-    /// Create a new [`ManualResetEvent`].
+    /// Create a new [`ManualResetEvent`] with the initial [`EventState`] set to `state`.
     pub const fn new(state: EventState) -> ManualResetEvent {
         Self {
             event: RawEvent::new(matches!(state, EventState::Set)),
@@ -174,13 +183,14 @@ impl ManualResetEvent {
     }
 
     /// Puts the [`ManualResetEvent`] into a set state, releasing all suspended waiters (if any)
-    /// and leaving the event set for future callers.
+    /// and leaving the event set for future callers to [`ManualResetEvent::wait()`] and co.
     pub fn set(&self) {
         self.event.set_all()
     }
 
     /// Set the state of the [`ManualResetEvent`] to [`EventState::Unset`], regardless of its
-    /// current state.
+    /// current state. This will cause future calls to [`ManualResetEvent::wait()`] to block until
+    /// the event is set (via [`ManualResetEvent::set()`]).
     pub fn reset(&self) {
         self.event.reset()
     }
@@ -188,8 +198,9 @@ impl ManualResetEvent {
 
 impl Awaitable for ManualResetEvent {
     /// Check if the underlying event is in a set state or wait for its state to become
-    /// [`EventState::Set`]. The event's state is not affected by this operation, i.e. it remains
-    /// set for future callers even after this function call returns.
+    /// [`EventState::Set`]. In contrast with [`AutoResetEvent::wait()`], the event's state is not
+    /// affected by this operation, i.e. it remains set for future callers even after this function
+    /// call returns, until a call to [`ManualResetEvent::reset()`] is made.
     fn wait(&self) {
         self.event.unlock_all()
     }
@@ -197,8 +208,8 @@ impl Awaitable for ManualResetEvent {
     /// Check if the underlying event is in a set state (and return immediately) or wait for it to
     /// become set, up to the limit specified by the `Duration` parameter.
     ///
-    /// Returns `true` if the event was initially set or if it became set within the timelimit
-    /// specified. Otherise returns `false` if the timeout elapsed without the event becoming
+    /// Returns `true` if the event was initially set or if it became set within the timeout
+    /// specified, otherwise returns `false` if the timeout elapsed without the event becoming
     /// available.
     fn wait_for(&self, limit: Duration) -> bool {
         self.event.wait_all_for(limit)
@@ -207,7 +218,7 @@ impl Awaitable for ManualResetEvent {
     /// Test if an event is available without blocking, returning `false` immediately if it is
     /// not set.
     ///
-    /// Note that this is not the same as calling [`Awaitable::wait_for()`] with a `Duration` of
+    /// Note that this is not the same as calling [`ManualResetEvent::wait_for()`] with a `Duration` of
     /// zero, as the calling thread never yields.
     fn wait0(&self) -> bool {
         self.event.try_unlock_all()
