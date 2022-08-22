@@ -280,8 +280,10 @@ impl RawEvent {
                     self.0.store(true, Ordering::Release);
                 } else {
                     // There's no need to guarantee synchronization of code before/after the
-                    // set/wait() call points when the event wasn't available.
-                    self.0.store(false, Ordering::Relaxed);
+                    // set/wait() call points when the event wasn't available, so there's no need to
+                    // write anything to the event's inner state (which might also race with a
+                    // second simultaneous `set_one()` call and result in us writing `false` here
+                    // immediately after another thread wrote `true`).
                 }
                 plc::DEFAULT_UNPARK_TOKEN
             })
