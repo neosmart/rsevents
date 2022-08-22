@@ -53,12 +53,18 @@ pub trait Awaitable {
     /// `Awaitable` becoming set).
     fn wait_for(&self, limit: Duration) -> bool;
 
-    /// Test if the awaitable type is available without blocking, return `false` immediately if it
-    /// is not. This call may have side effects beyond merely returning the current state and should
+    /// Test if the awaitable type is available, return `false` if it is not.
+    /// This call may have side effects beyond merely returning the current state and should
     /// not be considered a `test()` or `peek()` function.
-    /// Note that this is not the same as calling [`Awaitable::wait_for()`] with a `Duration` of
-    /// zero, as the calling thread never yields.
-    fn wait0(&self) -> bool;
+    ///
+    /// Note that this may not be the same as calling [`Awaitable::wait_for()`] with a `Duration` of
+    /// zero, as the implementing type may use a different approach to ensure that the calling
+    /// thread does not block.
+    fn wait0(&self) -> bool {
+        // The default implementation of this method is to just call `wait_for()` with a zero wait.
+        // The function should be overridden if a better alternative is possible.
+        return self.wait_for(Duration::ZERO);
+    }
 }
 
 /// An `AutoResetEvent` is a gated event that is functionally equivalent to a "waitable
