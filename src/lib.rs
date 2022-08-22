@@ -22,6 +22,9 @@ use std::time::{Duration, Instant};
 mod tests;
 
 /// A wrapper around an atomic state that represents whether or not the event is available.
+/// This isn't pinned and it seems that pinning is unnecessary because the lock may be moved so long
+/// as it is not borrowed (for prior art, see rust's `src/sys/windows/locks/mutex.rs` which is
+/// similarly directly exposed without pinning/boxing to make a movable mutex.
 struct RawEvent(AtomicBool);
 
 /// A representation of the state of an event, which can either be `Set` (i.e. signalled,
