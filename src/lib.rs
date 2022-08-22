@@ -40,6 +40,8 @@ pub enum EventState {
 }
 
 #[doc(hidden)]
+/// This is for backwards compatibility with earlier `rsevents` releases, which used the less
+/// specific (and much more likely to conflict) name `State` instead of `EventState`.
 pub type State = EventState;
 
 pub trait Awaitable {
