@@ -314,6 +314,10 @@ impl RawEvent {
     }
 
     fn wait_one_for(&self, limit: Duration) -> bool {
+        if self.try_unlock_one() {
+            return true;
+        }
+
         let end = Instant::now() + limit;
         let wait_result = unsafe {
             plc::park(
@@ -330,6 +334,10 @@ impl RawEvent {
     }
 
     fn wait_all_for(&self, limit: Duration) -> bool {
+        if self.try_unlock_all() {
+            return true;
+        }
+
         let end = Instant::now() + limit;
         let wait_result = unsafe {
             plc::park(
