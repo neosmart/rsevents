@@ -308,39 +308,38 @@ impl RawEvent {
             // check on the state before setting the WAITING bit for itself, otherwise it can't know
             // if there are any other threads waiting so it can't clear the WAITING bit, and if it
             // can't clear the WAITING bit, it can't obtain the event.
-            match state {
-                s if (s & AVAILABLE_BIT) != 0 => {
-                    match self.0.compare_exchange_weak(state, state & !AVAILABLE_BIT, Ordering::Acquire, Ordering::Relaxed) {
-                        Ok(_) => {
-                            // The lock was obtained; there may or may not be other threads suspended.
-                            return true;
-                        }
-                        Err(s) => {
-                            // Another thread contended with this call, loop to try again.
-                            state = s;
-                            continue;
-                        }
+            if (state & AVAILABLE_BIT) != 0 {
+                // The lock is available; try to obtain it even if the WAITING bit is set by
+                // another thread.
+                match self.0.compare_exchange_weak(state, state & !AVAILABLE_BIT, Ordering::Acquire, Ordering::Relaxed) {
+                    Ok(_) => {
+                        // The lock was obtained; there may or may not be other threads suspended.
+                        return true;
                     }
-                },
-                s if (s & WAITING_BIT) == 0 => {
-                    // There are no other threads waiting, so we need to set the WAITING bit
-                    // ourselves before we try to park the thread.
-                    match self.0.compare_exchange_weak(state, state | WAITING_BIT, Ordering::Relaxed, Ordering::Relaxed) {
-                        Ok(_) => {
-                            // We set the WAITING bit and can continue with attempting to park this
-                            // thread.
-                        },
-                        Err(s) => {
-                            // Another thread contended with this call, loop to try again.
-                            state = s;
-                            continue;
-                        }
+                    Err(s) => {
+                        // Another thread contended with this call, loop to try again.
+                        state = s;
+                        continue;
                     }
                 }
-                _ => {
-                    // The event isn't available and another thread has already marked it as
-                    // pending, so we are good to go.
+            }
+            else if (state & WAITING_BIT) == 0 {
+                // There are no other threads waiting, so we need to set the WAITING bit ourselves
+                // before we try to park the thread.
+                match self.0.compare_exchange_weak(state, state | WAITING_BIT, Ordering::Relaxed, Ordering::Relaxed) {
+                    Ok(_) => {
+                        // We set the WAITING bit and can continue with attempting to park this
+                        // thread.
+                    },
+                    Err(s) => {
+                        // Another thread contended with this call, loop to try again.
+                        state = s;
+                        continue;
+                    }
                 }
+            } else {
+                // The event isn't available and another thread has already marked it as pending, so
+                // we are good to go.
             }
 
             // This callback is run with the plc queue locked, before the thread is parked. If it
@@ -373,7 +372,7 @@ impl RawEvent {
                 // become available (or the WAITING bit could have been cleared because another
                 // thread, which was the last actually parked thread, was awoken).
                 // Loop to retry so we never miss a set() call.
-                ParkResult::Invalid => continue,
+                ParkResult::Invalid => state = self.0.load(Ordering::Relaxed),
                 // The timeout was reached before the thread could be obtained.
                 ParkResult::TimedOut => return false,
                 // The thread was awoken by another thread calling into unlock_one().
@@ -394,31 +393,28 @@ impl RawEvent {
             // check on the state before setting the WAITING bit for itself, otherwise it can't know
             // if there are any other threads waiting so it can't clear the WAITING bit, and if it
             // can't clear the WAITING bit, it can't directly obtain the event for itself.
-            match state {
-                s if (s & AVAILABLE_BIT) != 0 => {
-                    // The event has become available. We can return right away; we don't care about
-                    // anything else.
-                    return true;
-                },
-                s if (s & WAITING_BIT) == 0 => {
-                    // There are no other threads waiting, so we need to set the WAITING bit
-                    // ourselves before we try to park the thread.
-                    match self.0.compare_exchange_weak(state, state | WAITING_BIT, Ordering::Relaxed, Ordering::Relaxed) {
-                        Ok(_) => {
-                            // We set the WAITING bit without contention and can move on to trying
-                            // to park this thread.
-                        },
-                        Err(s) => {
-                            // Another thread contended with this call, loop to try again.
-                            state = s;
-                            continue;
-                        }
+            if (state & AVAILABLE_BIT) != 0 {
+                // The event has become available. We can return right away; we don't care about
+                // anything else.
+                return true;
+            }
+            else if (state & WAITING_BIT) == 0 {
+                // There are no other threads waiting, so we need to set the WAITING bit ourselves
+                // before we try to park the thread.
+                match self.0.compare_exchange_weak(state, state | WAITING_BIT, Ordering::Relaxed, Ordering::Relaxed) {
+                    Ok(_) => {
+                        // We set the WAITING bit without contention and can move on to trying to
+                        // park this thread.
+                    },
+                    Err(s) => {
+                        // Another thread contended with this call, loop to try again.
+                        state = s;
+                        continue;
                     }
                 }
-                _ => {
-                    // The event isn't available and another thread has already marked it as
-                    // pending, so we are good to go.
-                }
+            } else {
+                // The event isn't available and another thread has already marked it as pending, so
+                // we are good to go.
             }
 
             // This callback is run with the plc queue locked, before the thread is parked. If it
@@ -451,7 +447,7 @@ impl RawEvent {
                 // become available (or the WAITING bit could have been cleared because another
                 // thread, which was the last actually parked thread, was awoken).
                 // Loop to retry so we never miss a set() call.
-                ParkResult::Invalid => continue,
+                ParkResult::Invalid => state = self.0.load(Ordering::Relaxed),
                 // The timeout was reached before the thread could be obtained.
                 ParkResult::TimedOut => return false,
                 // The thread was awoken by another thread calling into unlock_all().
@@ -462,28 +458,56 @@ impl RawEvent {
 
     /// Trigger the event, releasing one waiter
     fn set_one(&self) {
-        match self.0.compare_exchange(0, AVAILABLE_BIT, Ordering::Release, Ordering::Relaxed) {
-            Ok(0) => {
-                // There were no parked/suspended threads so we were able to "fast set" the event
-                // without worrying about synchronizing with threads parked or about to park.
-                return;
-            }
-            Err(AVAILABLE_BIT) => {
-                // This was a call to set_one() on an event that was already set; we don't need to
-                // "do" anything but we need to touch the shared memory location to ensure
-                // memory ordering.
-                //
-                // It may be possible to forego this, but I'm not sure if that's wise. It is true
-                // that a thread awoken after two back-to-back set() calls is guaranteed to see at
-                // least _something_ new without an explicit Release here, but there's no guarantee
-                // that there will ever be any more set() calls afterwards, meaning whatever was
-                // written by the thread making the second set() call may never wind up being
-                // observed by a thread that fast-obtains the event in a wait() call.
-                self.0.fetch_or(0, Ordering::Release);
-                return;
-            },
-            _ => {
-                // We need to handle threads parked or trying to park
+        let mut state = self.0.load(Ordering::Relaxed);
+        loop {
+            match state {
+                0b00 => {
+                    // There are no parked/suspended threads so we are able to "fast set" the event
+                    // without worrying about synchronizing with threads parked or about to park.
+                    match self.0.compare_exchange_weak(0, AVAILABLE_BIT, Ordering::Release, Ordering::Relaxed) {
+                        Ok(_) => return,
+                        Err(s) => {
+                            // We raced with a thread trying to park or another call to set(). Loop
+                            // to figure out what happened.
+                            state = s;
+                            continue;
+                        },
+                    }
+                },
+                0b01 => {
+                    // This was a call to set_one() on an event that was already set; we don't need to
+                    // "do" anything but we need to touch the shared memory location to ensure
+                    // memory ordering.
+                    //
+                    // It may be possible to forego this, but I'm not sure if that's wise. It is true
+                    // that a thread awoken after two back-to-back set() calls is guaranteed to see at
+                    // least _something_ new without an explicit Release here, but there's no guarantee
+                    // that there will ever be any more set() calls afterwards, meaning whatever was
+                    // written by the thread making the second set() call may never wind up being
+                    // observed by a thread that fast-obtains the event in a wait() call.
+                    match self.0.compare_exchange_weak(state, state, Ordering::Release, Ordering::Relaxed) {
+                        Ok(_) => return,
+                        Err(s) => {
+                            state = s;
+                            continue;
+                        },
+                    }
+                },
+                0b10 => {
+                    // A thread is waiting to obtain this event, so we can't fast set it and must
+                    // instead go through the plc queue lock.
+                    break;
+                },
+                0b11 => {
+                    // This shouldn't happen as we never set the event (which makes it available for
+                    // grabs by any past or future waiter) if there are threads waiting on it.
+                    // Instead, we manually hand off the event to another thread below with
+                    // plc::unpark_one().
+                    debug_assert!(false, "AVAILABLE and WAITING bits set!");
+                },
+                _ => {
+                    unreachable!("We only use the lowest two bits of the AtomicU8 state!");
+                },
             }
         }
 
@@ -510,13 +534,17 @@ impl RawEvent {
                     // and it won't be able to obtain the event.
                     self.0.store(AVAILABLE_BIT, Ordering::Release);
                 } else if !unpark_result.have_more_threads {
-                    // Clear the WAITING bit without touching the AVAILABLE bit. This makes it
-                    // possible for the next call to set_one() to fast-set the event without going
-                    // through the plc lock.
-                    self.0.fetch_and(!WAITING_BIT, Ordering::Relaxed);
+                    // Clear the WAITING bit. Don't stomp the AVAILABLE bit in case we raced with
+                    // another set() call.
+                    // This makes it possible for the next call to set_one() to fast-set the event
+                    // without going through the plc lock and triggers a retry in any threads trying
+                    // to park.
+                    self.0.fetch_and(!WAITING_BIT, Ordering::Release);
                 } else {
                     // One thread was unparked but there are others still waiting. Subsequent
-                    // set_one() calls will still need to go through the plc lock.
+                    // set_one() calls will still need to go through the plc lock. We need to write
+                    // to the shared memory address to guarantee Release semantics.
+                    self.0.fetch_or(WAITING_BIT, Ordering::Release);
                 }
                 plc::DEFAULT_UNPARK_TOKEN
             })
@@ -541,7 +569,7 @@ impl RawEvent {
 
         // NOTE: _unparked may equal zero if there were no threads fully parked but there was a
         // thread _about_ to park until changing the state above caused its validation callback to
-        // fail.
+        // fail and then on retry they just obtained the available lock and returned.
     }
 
     fn unlock_one(&self) {
