@@ -58,6 +58,71 @@ fn basic_double_unlock_manual() {
 }
 
 #[test]
+fn auto_event_timeout() {
+    let event = AutoResetEvent::new(EventState::Unset);
+    assert_eq!(false, event.wait_for(Duration::from_micros(200)));
+}
+
+#[test]
+fn manual_event_timeout() {
+    let event = ManualResetEvent::new(EventState::Unset);
+    assert_eq!(false, event.wait_for(Duration::from_micros(200)));
+}
+
+#[test]
+fn saturating_set() {
+    let event = AutoResetEvent::new(EventState::Unset);
+    event.set();
+    event.set();
+    assert_eq!(true, event.wait0());
+    assert_eq!(false, event.wait0());
+}
+
+#[test]
+fn auto_event_no_timeout() {
+    let thread_spawned = Arc::new(ManualResetEvent::new(EventState::Unset));
+    let event = Arc::new(AutoResetEvent::new(EventState::Unset));
+    let thread = {
+        let thread_spawned = thread_spawned.clone();
+        let event = event.clone();
+        thread::spawn(move || {
+            thread_spawned.set();
+            // assert_eq!(false, event.wait0());
+            event.wait_for(Duration::from_secs(1))
+        })
+    };
+    // Try to avoid the event being available when the thread first checks by sleeping
+    // until the thread has been spawned.
+    thread_spawned.wait();
+    thread::sleep(Duration::from_millis(200));
+    event.set();
+
+    assert!(matches!(thread.join(), Ok(true)));
+}
+
+#[test]
+fn manual_event_no_timeout() {
+    let thread_spawned = Arc::new(ManualResetEvent::new(EventState::Unset));
+    let event = Arc::new(ManualResetEvent::new(EventState::Unset));
+    let thread = {
+        let thread_spawned = thread_spawned.clone();
+        let event = event.clone();
+        thread::spawn(move || {
+            thread_spawned.set();
+            // assert_eq!(false, event.wait0());
+            event.wait_for(Duration::from_secs(1))
+        })
+    };
+    // Try to avoid the event being available when the thread first checks by sleeping
+    // until the thread has been spawned.
+    thread_spawned.wait();
+    thread::sleep(Duration::from_millis(200));
+    event.set();
+
+    assert!(matches!(thread.join(), Ok(true)));
+}
+
+#[test]
 fn suspend_and_resume() {
     // This is the main event we're trying to wait on
     let event1 = Arc::new(AutoResetEvent::new(State::Unset));
@@ -83,35 +148,51 @@ fn suspend_and_resume() {
 /// a time, and verify cache coherence of unsynchronized access to a non-atomic variable is
 /// maintained by the calls to set() and wait().
 fn auto_reset_cache_coherence() {
-    const THREAD_COUNT: usize = 20;
-    let event = Arc::new(AutoResetEvent::new(State::Unset));
-    // event2 is used to signal that a waiter has finished
-    let event2 = Arc::new(AutoResetEvent::new(State::Unset));
+    use tiny_rng::{Rand, Rng};
 
-    // We are not using an atomic here to ensure that AutoResetEvent set/wait()
+    const THREAD_COUNT: usize = 20;
+    static EVENT1: AutoResetEvent = AutoResetEvent::new(State::Unset);
+    static EVENT2: AutoResetEvent = AutoResetEvent::new(State::Unset);
+
+    // We are not using an atomic here to test whether or not AutoResetEvent set/wait()
     // pairs guarantee memory order.
     static mut SUCCEED_COUNT: usize = 0_usize;
 
-    let create_waiter = || {
-        let event = event.clone();
-        let event2 = event2.clone();
+    let create_waiter = move |i: usize| {
         thread::spawn(move || {
+            // eprintln!("Thread {} spawned", i);
             // Wait for exclusive access
-            event.wait();
+            if !EVENT1.wait_for(Duration::from_secs_f32(1.5)) {
+                panic!("Worker thread {} timed out waiting for EVENT1", i);
+            }
             unsafe { SUCCEED_COUNT += 1; }
             // Allow another thread in
-            event2.set();
+            EVENT2.set();
+            // eprintln!("Worker thread {} set EVENT2", i);
         })
     };
 
-    // Create 50 threads that will contend for the event
-    let mut join_handles = Vec::new();
-    for _ in 0..THREAD_COUNT {
-        join_handles.push(create_waiter());
-    }
+    // Create threads that will contend for the event, but don't create them all at once.
+    // This hopefully lets us test a mix of fast obtain, try-park-but-obtain, and park-then-obtain
+    // scenarios.
+
+    let spawner = thread::spawn(move || {
+        let mut join_handles = Vec::new();
+        for i in 0..THREAD_COUNT {
+            let mut rng = Rng::from_seed(i as u64);
+            join_handles.push(create_waiter(i));
+            thread::sleep(Duration::from_micros(rng.rand_range_u64(0, 300)));
+            // for _ in 0..i*4 {
+                std::thread::yield_now();
+            // }
+        }
+        // eprintln!("Spawned {} threads", THREAD_COUNT);
+
+        join_handles
+    });
 
     // Hopefully let just one event through, observing the initial value
-    event.set();
+    EVENT1.set();
 
     // Yield for 100 time slices
     for _ in 0..100 {
@@ -119,11 +200,14 @@ fn auto_reset_cache_coherence() {
     }
 
     for i in 0..THREAD_COUNT {
-        event2.wait();
+        if !EVENT2.wait_for(Duration::from_secs(4)) {
+            panic!("Timeout waiting for worker thread {} EVENT2.", i);
+        }
         assert_eq!(unsafe { SUCCEED_COUNT }, i + 1);
-        event.set();
+        EVENT1.set();
     }
 
+    let join_handles = spawner.join().unwrap();
     for jh in join_handles {
         jh.join().unwrap();
     }
