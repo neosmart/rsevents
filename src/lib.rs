@@ -506,11 +506,11 @@ impl RawEvent {
                     break;
                 },
                 0b11 => {
-                    // This shouldn't happen as we never set the event (which makes it available for
-                    // grabs to any past or future waiter) if there are threads waiting on it.
-                    // Instead, we manually hand off the event to another thread below with
-                    // plc::unpark_one().
-                    debug_assert!(false, "AVAILABLE and WAITING bits set!");
+                    // This shouldn't happen but it's hard to guarantee because of the interplay
+                    // between concurrent `set_one()` calls at the same time as a `suspend_one()`
+                    // call attempts to park a thread.
+                    #[cfg(any(test, miri))]
+                    assert!(false, "AVAILABLE and WAITING bits set!");
                     break;
                 },
                 _ => {
