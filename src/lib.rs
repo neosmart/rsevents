@@ -176,7 +176,12 @@ impl Awaitable for AutoResetEvent {
     /// Note that this is similar but not identical to calling [`AutoResetEvent::wait_for()`] with a
     /// `Duration` of zero, as the calling thread never blocks or yields.
     fn wait0(&self) -> bool {
-        self.event.try_unlock_one()
+        // In case of miri or if testing under ARM, make sure that a top-level wait0() call from
+        // outside the implementation code returns a deterministic result.
+        #[cfg(any(test, miri))]
+        return self.event.test_try_unlock_one();
+        #[cfg(not(any(test, miri)))]
+        return self.event.try_unlock_one();
     }
 }
 
@@ -269,6 +274,16 @@ impl RawEvent {
     fn try_unlock_one(&self) -> bool {
         // Obtains the event if it is both available and there are no threads waiting on it.
         self.0.compare_exchange_weak(AVAILABLE_BIT, 0, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    #[cfg(any(test, miri))]
+    /// This entry point is used to deterministically determine if the event could be obtained
+    /// without any spurious failures. We don't override the actual behavior of try_unlock_one() so
+    /// that any internal functions calling into it can still be tested against both normal and
+    /// spurious failure modes.
+    fn test_try_unlock_one(&self) -> bool {
+        self.0.compare_exchange(AVAILABLE_BIT, 0, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
     }
 
