@@ -458,7 +458,14 @@ impl RawEvent {
 
     /// Trigger the event, releasing one waiter
     fn set_one(&self) {
-        let mut state = self.0.load(Ordering::Relaxed);
+        // Optimize for cases where the event wasn't available and isn't under any contention.
+        // NOTE: This makes calling set() on an already set event more expensive. This match block
+        // can be replaced with `self.0.load(Ordering::Relaxed)` to bypass this optimization.
+        let mut state = match self.0.compare_exchange(0, AVAILABLE_BIT, Ordering::Release, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(s) => s,
+        };
+
         loop {
             match state {
                 0b00 => {
@@ -500,13 +507,15 @@ impl RawEvent {
                 },
                 0b11 => {
                     // This shouldn't happen as we never set the event (which makes it available for
-                    // grabs by any past or future waiter) if there are threads waiting on it.
+                    // grabs to any past or future waiter) if there are threads waiting on it.
                     // Instead, we manually hand off the event to another thread below with
                     // plc::unpark_one().
                     debug_assert!(false, "AVAILABLE and WAITING bits set!");
+                    break;
                 },
                 _ => {
-                    unreachable!("We only use the lowest two bits of the AtomicU8 state!");
+                    // We only use the lowest two bits of the AtomicU8 state
+                    unsafe { core::hint::unreachable_unchecked() }
                 },
             }
         }
