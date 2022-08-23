@@ -5,23 +5,23 @@ use std::thread;
 
 #[test]
 fn sanity_check() {
-    let event = RawEvent::new(true);
+    let event = RawEvent::new(AVAILABLE_BIT);
     assert_eq!(true, event.try_unlock_one());
 
-    let event = RawEvent::new(false);
+    let event = RawEvent::new(0);
     assert_eq!(false, event.try_unlock_one());
 }
 
 #[test]
 fn basic_locking() {
-    let event = RawEvent::new(false);
+    let event = RawEvent::new(0);
     event.set_all();
     assert_eq!(true, event.try_unlock_one());
 }
 
 #[test]
 fn basic_unlocking() {
-    let event = RawEvent::new(true);
+    let event = RawEvent::new(AVAILABLE_BIT);
     event.reset();
     assert_eq!(false, event.try_unlock_one());
 }

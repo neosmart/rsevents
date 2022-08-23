@@ -15,21 +15,47 @@
 
 use parking_lot_core as plc;
 use parking_lot_core::ParkResult;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
 mod tests;
 
+/// The event is available when this bit is set, otherwise it is unavailable.
+const AVAILABLE_BIT: u8 = 0x01;
+/// There are one or more threads waiting to obtain the event.
+const WAITING_BIT: u8 = 0x02;
+
 /// A wrapper around an atomic state that represents whether or not the event is available.
 /// This isn't pinned and it seems that pinning is unnecessary because the lock may be moved so long
 /// as it is not borrowed (for prior art, see rust's `src/sys/windows/locks/mutex.rs` which is
 /// similarly directly exposed without pinning/boxing to make a movable mutex.
-struct RawEvent(AtomicBool);
+///
+/// The lowest two bits of the u8 state are used, 0b010 represents the WAITING bit which is set when
+/// a thread is parked or about to park, and 0b001 represents the AVAILABLE bit, set when the event
+/// is available and cleared otherwise.
+///
+/// The following combinations are possible:
+/// * 0b00: Unavailable
+///   The event is not available and no threads are waiting on it. It can be "fast set" without
+///   going through the plc lock.
+/// * 0b01: Available
+///   The event is available and there are no threads waiting on it. It can be "fast obtained"
+///   without going through the plc lock.
+/// * 0b10: Unavailable w/ Parked Waiters
+///   The event is unavailable and there are one or more threads parked or trying to park to wait
+///   for the event to become available. We must go through the plc lock to preferentially "give"
+///   the event to a waiting thread.
+/// * 0b11: Available w/ Parked Threads
+///   The event is available but there are parked threads waiting for it. This is not a valid state
+///   and no function should end with this being the quiescent state.
+///
+struct RawEvent(AtomicU8);
 
 /// A representation of the state of an event, which can either be `Set` (i.e. signalled,
 /// ready) or `Unset` (i.e. not ready).
 #[derive(Clone, Debug, PartialEq)]
+#[repr(u8)]
 pub enum EventState {
     /// The event is available and call(s) to [`Awaitable::wait()`] will go through without
     /// blocking, i.e. the event is signalled.
@@ -103,7 +129,10 @@ impl AutoResetEvent {
     /// Create a new [`AutoResetEvent`] that can be used to atomically signal one waiter at a time.
     pub const fn new(state: EventState) -> AutoResetEvent {
         Self {
-            event: RawEvent::new(matches!(state, EventState::Set)),
+            event: RawEvent::new(match state {
+                EventState::Set => AVAILABLE_BIT,
+                EventState::Unset => 0,
+            })
         }
     }
 
@@ -178,7 +207,10 @@ impl ManualResetEvent {
     /// Create a new [`ManualResetEvent`] with the initial [`EventState`] set to `state`.
     pub const fn new(state: EventState) -> ManualResetEvent {
         Self {
-            event: RawEvent::new(matches!(state, EventState::Set)),
+            event: RawEvent::new(match state {
+                EventState::Set => AVAILABLE_BIT,
+                EventState::Unset => 0,
+            })
         }
     }
 
@@ -226,55 +258,220 @@ impl Awaitable for ManualResetEvent {
 }
 
 impl RawEvent {
-    const fn new(state: bool) -> RawEvent {
-        RawEvent(AtomicBool::new(state))
+    const fn new(state: u8) -> RawEvent {
+        RawEvent(AtomicU8::new(state))
     }
 
+    #[inline]
     /// Attempts to exclusively obtain the event. Returns true upon success. Called internally by
     /// [`suspend_one()`](Self::suspend_one) when determining if a thread should be parked/suspended
     /// or if that's not necessary.
     fn try_unlock_one(&self) -> bool {
-        self.0.swap(false, Ordering::Acquire)
+        // Obtains the event if it is both available and there are no threads waiting on it.
+        self.0.compare_exchange_weak(AVAILABLE_BIT, 0, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
     }
 
+    #[inline]
     /// Attempts to obtain the event (without locking out future callers). Returns true upon success.
     fn try_unlock_all(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        // Obtains the event if it is available, with no preconditions.
+        (self.0.load(Ordering::Acquire) & AVAILABLE_BIT) != 0
     }
 
     /// Parks the calling thread until the underlying event has unlocked. If the event is set during
     /// this call, the park aborts/returns early so that no event sets are missed. Consumes the
     /// event's set state in case of early return.
-    unsafe fn suspend_one(&self) {
-        plc::park(
-            self as *const RawEvent as usize, // key for keyed event
-            || !self.try_unlock_one(), // whether or not to go through with the park, run while
-                                       // queue is locked
-            || {}, // callback before parking, run after queue is unlocked
-            |_, _| {}, // timeout handler, run while queue is locked
-            plc::DEFAULT_PARK_TOKEN,
-            None, // timeout
-        );
+    ///
+    /// Returns `true` only if the thread has obtained the thread, otherwise returns `false` (only
+    /// possible in the case of a timeout).
+    unsafe fn suspend_one(&self, timeout: Option<Duration>) -> bool {
+        let timeout = timeout.map(|duration| Instant::now() + duration);
+        let mut state = self.0.load(Ordering::Relaxed);
+        loop {
+            // The only way a thread can obtain the event _before_ it is parked/put to sleep is to
+            // check on the state before setting the WAITING bit for itself, otherwise it can't know
+            // if there are any other threads waiting so it can't clear the WAITING bit, and if it
+            // can't clear the WAITING bit, it can't obtain the event.
+            match state {
+                s if (s & AVAILABLE_BIT) != 0 => {
+                    match self.0.compare_exchange_weak(state, state & !AVAILABLE_BIT, Ordering::Acquire, Ordering::Relaxed) {
+                        Ok(_) => {
+                            // The lock was obtained; there may or may not be other threads suspended.
+                            return true;
+                        }
+                        Err(s) => {
+                            // Another thread contended with this call, loop to try again.
+                            state = s;
+                            continue;
+                        }
+                    }
+                },
+                s if (s & WAITING_BIT) == 0 => {
+                    // There are no other threads waiting, so we need to set the WAITING bit
+                    // ourselves before we try to park the thread.
+                    match self.0.compare_exchange_weak(state, state | WAITING_BIT, Ordering::Relaxed, Ordering::Relaxed) {
+                        Ok(_) => {
+                            // We set the WAITING bit and can continue with attempting to park this
+                            // thread.
+                        },
+                        Err(s) => {
+                            // Another thread contended with this call, loop to try again.
+                            state = s;
+                            continue;
+                        }
+                    }
+                }
+                _ => {
+                    // The event isn't available and another thread has already marked it as
+                    // pending, so we are good to go.
+                }
+            }
+
+            // This callback is run with the plc queue locked, before the thread is parked. If it
+            // returns false, the park is aborted. We can't opportunistically claim the event here
+            // even if it is available, because we don't know if there are other suspended threads,
+            // which means we can't clear the WAITING bit in case we were the last thread.
+            let before_suspend = || -> bool {
+                self.0.load(Ordering::Relaxed) == WAITING_BIT
+            };
+
+            // This callback is run with the plc queue locked, which is the only time we can safely
+            // clear the WAITING bit (because `before_suspend` checks the WAITING bit with the queue
+            // locked as well), making it possible to abort/retry the park() call if there's any
+            // contention.
+            let on_timeout = |_, last_thread| {
+                if last_thread {
+                    self.0.fetch_and(!WAITING_BIT, Ordering::Relaxed);
+                }
+            };
+
+            match plc::park(
+                self as *const RawEvent as usize, // key for keyed event
+                before_suspend,
+                || {}, // callback before parking, run after queue is unlocked
+                on_timeout,
+                plc::DEFAULT_PARK_TOKEN,
+                timeout,
+            ) {
+                // before_suspend() detected a change in the state that indicates the lock may have
+                // become available (or the WAITING bit could have been cleared because another
+                // thread, which was the last actually parked thread, was awoken).
+                // Loop to retry so we never miss a set() call.
+                ParkResult::Invalid => continue,
+                // The timeout was reached before the thread could be obtained.
+                ParkResult::TimedOut => return false,
+                // The thread was awoken by another thread calling into unlock_one().
+                ParkResult::Unparked(_) => return true,
+            }
+        }
     }
 
     /// Parks the calling thread until the underlying event has unlocked. If the event is set during
     /// this call, the park aborts/returns early so that no event sets are missed. Unlike
     /// [`suspend_one()`](Self::suspend_one), does not consume the event's set state in case of
     /// early return.
-    unsafe fn suspend_all(&self) {
-        plc::park(
-            self as *const RawEvent as usize, // key for keyed event
-            || !self.try_unlock_all(), // whether or not to go through with the park, run while
-                                       // queue is locked
-            || {}, // callback before parking, run after queue is unlocked
-            |_, _| {}, // timeout handler, run while queue is locked
-            plc::DEFAULT_PARK_TOKEN,
-            None, // timeout
-        );
+    unsafe fn suspend_all(&self, timeout: Option<Duration>) -> bool {
+        let timeout = timeout.map(|duration| Instant::now() + duration);
+        let mut state = self.0.load(Ordering::Relaxed);
+        loop {
+            // The only way a thread can obtain the event _before_ it is parked/put to sleep is to
+            // check on the state before setting the WAITING bit for itself, otherwise it can't know
+            // if there are any other threads waiting so it can't clear the WAITING bit, and if it
+            // can't clear the WAITING bit, it can't directly obtain the event for itself.
+            match state {
+                s if (s & AVAILABLE_BIT) != 0 => {
+                    // The event has become available. We can return right away; we don't care about
+                    // anything else.
+                    return true;
+                },
+                s if (s & WAITING_BIT) == 0 => {
+                    // There are no other threads waiting, so we need to set the WAITING bit
+                    // ourselves before we try to park the thread.
+                    match self.0.compare_exchange_weak(state, state | WAITING_BIT, Ordering::Relaxed, Ordering::Relaxed) {
+                        Ok(_) => {
+                            // We set the WAITING bit without contention and can move on to trying
+                            // to park this thread.
+                        },
+                        Err(s) => {
+                            // Another thread contended with this call, loop to try again.
+                            state = s;
+                            continue;
+                        }
+                    }
+                }
+                _ => {
+                    // The event isn't available and another thread has already marked it as
+                    // pending, so we are good to go.
+                }
+            }
+
+            // This callback is run with the plc queue locked, before the thread is parked. If it
+            // returns false, the park is aborted. We can't opportunistically claim the event here
+            // even if it is available, because we don't know if there are other suspended threads,
+            // which means we can't clear the WAITING bit in case we were the last thread.
+            let before_suspend = || -> bool {
+                self.0.load(Ordering::Relaxed) == WAITING_BIT
+            };
+
+            // This callback is run with the plc queue locked, which is the only time we can safely
+            // clear the WAITING bit (because `before_suspend` checks the WAITING bit with the queue
+            // locked as well), making it possible to abort/retry the park() call if there's any
+            // contention.
+            let on_timeout = |_, last_thread| {
+                if last_thread {
+                    self.0.fetch_and(!WAITING_BIT, Ordering::Relaxed);
+                }
+            };
+
+            match plc::park(
+                self as *const RawEvent as usize, // key for keyed event
+                before_suspend,
+                || {}, // callback before parking, run after queue is unlocked
+                on_timeout,
+                plc::DEFAULT_PARK_TOKEN,
+                timeout,
+            ) {
+                // before_suspend() detected a change in the state that indicates the lock may have
+                // become available (or the WAITING bit could have been cleared because another
+                // thread, which was the last actually parked thread, was awoken).
+                // Loop to retry so we never miss a set() call.
+                ParkResult::Invalid => continue,
+                // The timeout was reached before the thread could be obtained.
+                ParkResult::TimedOut => return false,
+                // The thread was awoken by another thread calling into unlock_all().
+                ParkResult::Unparked(_) => return true,
+            }
+        }
     }
 
     /// Trigger the event, releasing one waiter
     fn set_one(&self) {
+        match self.0.compare_exchange(0, AVAILABLE_BIT, Ordering::Release, Ordering::Relaxed) {
+            Ok(0) => {
+                // There were no parked/suspended threads so we were able to "fast set" the event
+                // without worrying about synchronizing with threads parked or about to park.
+                return;
+            }
+            Err(AVAILABLE_BIT) => {
+                // This was a call to set_one() on an event that was already set; we don't need to
+                // "do" anything but we need to touch the shared memory location to ensure
+                // memory ordering.
+                //
+                // It may be possible to forego this, but I'm not sure if that's wise. It is true
+                // that a thread awoken after two back-to-back set() calls is guaranteed to see at
+                // least _something_ new without an explicit Release here, but there's no guarantee
+                // that there will ever be any more set() calls afterwards, meaning whatever was
+                // written by the thread making the second set() call may never wind up being
+                // observed by a thread that fast-obtains the event in a wait() call.
+                self.0.fetch_or(0, Ordering::Release);
+                return;
+            },
+            _ => {
+                // We need to handle threads parked or trying to park
+            }
+        }
+
         unsafe {
             // The unpark callback happens with the plc queue locked, so we guarantee that the logic
             // here happens either completely before or completely after the logic in the callback
@@ -286,15 +483,25 @@ impl RawEvent {
                 // set_one() call to be missed.
 
                 if unpark_result.unparked_threads == 0 {
-                    // Since the wakeup resulted in no threads being unparked, set the state to unlocked to
-                    // ensure that the event isn't missed.
-                    self.0.store(true, Ordering::Release);
+                    // This can happen if there were two simultaneous calls to set_one() with only
+                    // one thread parked or if there were no threads parked but a thread trying to
+                    // park (which then didn't happen when we changed the state above and it failed
+                    // the park validation callback).
+                    // It's not only safe but actually required to stomp the WAITING bit because we
+                    // have the plc queue locked - contending threads (about to park but not yet
+                    // parked) will retry. If we don't stomp the WAITING bit and there was only one
+                    // thread _about_ to park but not yet parked, it would loop after the park
+                    // validation callback failed, but the WAITING bit wouldn't have been cleared
+                    // and it won't be able to obtain the event.
+                    self.0.store(AVAILABLE_BIT, Ordering::Release);
+                } else if !unpark_result.have_more_threads {
+                    // Clear the WAITING bit without touching the AVAILABLE bit. This makes it
+                    // possible for the next call to set_one() to fast-set the event without going
+                    // through the plc lock.
+                    self.0.fetch_and(!WAITING_BIT, Ordering::Relaxed);
                 } else {
-                    // There's no need to guarantee synchronization of code before/after the
-                    // set/wait() call points when the event wasn't available, so there's no need to
-                    // write anything to the event's inner state (which might also race with a
-                    // second simultaneous `set_one()` call and result in us writing `false` here
-                    // immediately after another thread wrote `true`).
+                    // One thread was unparked but there are others still waiting. Subsequent
+                    // set_one() calls will still need to go through the plc lock.
                 }
                 plc::DEFAULT_UNPARK_TOKEN
             })
@@ -303,18 +510,29 @@ impl RawEvent {
 
     /// Trigger the event, releasing all waiters
     fn set_all(&self) {
-        if self.0.swap(true, Ordering::Release) == false {
-            // The event was previously unavailable
-            unsafe {
-                plc::unpark_all(self as *const RawEvent as usize, plc::DEFAULT_UNPARK_TOKEN)
-            };
+        // Stomp the WAITING bit (if set) so that no other thread wastes time trying to unpark
+        // threads since we're going to unlock them all.
+        let prev_state = self.0.swap(AVAILABLE_BIT, Ordering::Release);
+        if (prev_state & WAITING_BIT) == 0 {
+            // No threads were suspended/about to be suspended so we can just return. Or maybe there
+            // _are_ other threads suspended but we raced with a simultaneous call into set_all()
+            // and that other thread is going to handle waking them.
+            return;
         }
+
+        let _unparked = unsafe {
+            plc::unpark_all(self as *const RawEvent as usize, plc::DEFAULT_UNPARK_TOKEN)
+        };
+
+        // NOTE: _unparked may equal zero if there were no threads fully parked but there was a
+        // thread _about_ to park until changing the state above caused its validation callback to
+        // fail.
     }
 
     fn unlock_one(&self) {
         if !self.try_unlock_one() {
             unsafe {
-                self.suspend_one();
+                self.suspend_one(None);
             }
         }
     }
@@ -322,16 +540,17 @@ impl RawEvent {
     fn unlock_all(&self) {
         if !self.try_unlock_all() {
             unsafe {
-                self.suspend_all();
+                self.suspend_all(None);
             }
         }
     }
 
     /// Put the event in a locked (reset) state.
     fn reset(&self) {
+        // Clear the AVAILABLE bit without touching the WAITING bit.
         // Calling reset() does not imply any strict ordering of code before or after a matching
         // (try_)unlock() call, so we use Relaxed semantics.
-        self.0.store(false, Ordering::Relaxed);
+        self.0.fetch_and(!AVAILABLE_BIT, Ordering::Relaxed);
     }
 
     fn wait_one_for(&self, limit: Duration) -> bool {
@@ -339,19 +558,9 @@ impl RawEvent {
             return true;
         }
 
-        let end = Instant::now() + limit;
-        let wait_result = unsafe {
-            plc::park(
-                self as *const RawEvent as usize,
-                || !self.try_unlock_one(),
-                || {},
-                |_, _| {},
-                plc::DEFAULT_PARK_TOKEN,
-                Some(end),
-            )
-        };
-
-        wait_result != ParkResult::TimedOut
+        unsafe {
+            self.suspend_one(Some(limit))
+        }
     }
 
     fn wait_all_for(&self, limit: Duration) -> bool {
@@ -359,18 +568,8 @@ impl RawEvent {
             return true;
         }
 
-        let end = Instant::now() + limit;
-        let wait_result = unsafe {
-            plc::park(
-                self as *const RawEvent as usize,
-                || !self.try_unlock_all(),
-                || {},
-                |_, _| {},
-                plc::DEFAULT_PARK_TOKEN,
-                Some(end),
-            )
-        };
-
-        wait_result != ParkResult::TimedOut
+        unsafe {
+            self.suspend_all(Some(limit))
+        }
     }
 }
