@@ -429,9 +429,13 @@ impl RawEvent {
             // clear the WAITING bit (because `before_suspend` checks the WAITING bit with the queue
             // locked as well), making it possible to abort/retry the park() call if there's any
             // contention.
+            let mut timeout_result = false;
             let on_timeout = |_, last_thread| {
                 if last_thread {
-                    self.0.fetch_and(!WAITING_BIT, Ordering::Relaxed);
+                    // self.0.fetch_and(!WAITING_BIT, Ordering::Relaxed);
+                    if (self.0.swap(0, Ordering::Relaxed) & AVAILABLE_BIT) != 0 {
+                        timeout_result = true;
+                    }
                 }
             };
 
@@ -449,7 +453,7 @@ impl RawEvent {
                 // Loop to retry so we never miss a set() call.
                 ParkResult::Invalid => state = self.0.load(Ordering::Relaxed),
                 // The timeout was reached before the thread could be obtained.
-                ParkResult::TimedOut => return false,
+                ParkResult::TimedOut => return timeout_result,
                 // The thread was awoken by another thread calling into unlock_all().
                 ParkResult::Unparked(_) => return true,
             }
@@ -543,17 +547,20 @@ impl RawEvent {
                     // and it won't be able to obtain the event.
                     self.0.store(AVAILABLE_BIT, Ordering::Release);
                 } else if !unpark_result.have_more_threads {
-                    // Clear the WAITING bit. Don't stomp the AVAILABLE bit in case we raced with
-                    // another set() call.
-                    // This makes it possible for the next call to set_one() to fast-set the event
-                    // without going through the plc lock and triggers a retry in any threads trying
-                    // to park.
-                    self.0.fetch_and(!WAITING_BIT, Ordering::Release);
+                    // Clear the WAITING bit. We can stomp the AVAILABLE bit because until we clear
+                    // the WAITING bit, the AVAILABLE bit can only be set in the plc::unpark_one()
+                    // callback w/ the queue locked.
+                    // Clearing the WAITING bit makes it possible for the next call to set_one() to
+                    // fast-set the event without going through the plc lock and triggers a retry in
+                    // any threads trying to park.
+                    self.0.store(0, Ordering::Release);
                 } else {
                     // One thread was unparked but there are others still waiting. Subsequent
-                    // set_one() calls will still need to go through the plc lock. We need to write
-                    // to the shared memory address to guarantee Release semantics.
-                    self.0.fetch_or(WAITING_BIT, Ordering::Release);
+                    // set_one() calls will still need to go through the plc lock.
+                    // We need to write to the shared memory address to guarantee Release semantics,
+                    // and we can stomp the AVAILABLE bit since it can only be set with the plc lock
+                    // held once the WAITING bit is asserted.
+                    self.0.store(WAITING_BIT, Ordering::Release);
                 }
                 plc::DEFAULT_UNPARK_TOKEN
             })
