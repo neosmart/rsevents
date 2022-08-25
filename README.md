@@ -14,6 +14,10 @@ Depending on the specific type of the event, an event can also be thought of as 
 As with WIN32 events, rsevents come in two flavors, [`AutoResetEvent`](https://docs.rs/rsevents/latest/rsevents/struct.AutoResetEvent.html) and [`ManualResetEvent`](https://docs.rs/rsevents/latest/rsevents/struct.ManualResetEvent.html), which differ in their behavior when it comes to setting (aka signalling) an event.
 An `AutoResetEvent`, once signalled, permits exactly one (and only one) past or future caller waiting on the same event to unblock, whereas a `ManualResetEvent` lacks such fine-grained control and is either signalled and unblocked for all past/future waiters or none (until its state is manually/explicitly changed). Their usages differ tremendously so make sure you are using the correct event type for your needs!
 
+The types in the core `rsevents` crate are often useful for implementing other synchronization primitives. The [`rsevents-extra`](https://github.com/neosmart/rsevents-extra) crate contains some synchronization types that you might find useful, including
+* A countdown event, useful for efficiently waiting until _n_ outstanding tasks distributed to various threads have completed.
+* A semaphore, for limiting concurrent access to a section or resource to a maximum of _n_ threads.
+
 ## Example
 
 The following code is an example wherein the main thread dispatches work to a pool of spawned threads, which is then claimed by the first available thread.
