@@ -41,5 +41,6 @@ update:
 	@$(CARGO) update
 
 miri:
-	@env MIRIFLAGS=-Zmiri-disable-isolation\ -Zmiri-permissive-provenance $(CARGO) miri test
+	@env MIRIFLAGS=-Zmiri-disable-isolation\ -Zmiri-permissive-provenance\ \
+		$(CARGO) miri test -- --nocapture
 
