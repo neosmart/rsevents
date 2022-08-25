@@ -18,6 +18,7 @@
 
 use parking_lot_core as plc;
 use parking_lot_core::ParkResult;
+use std::convert::Infallible;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
@@ -53,7 +54,8 @@ const WAITING_BIT: u8 = 0x02;
 ///   The event is available but there are parked threads waiting for it. This is not a valid state
 ///   and no function should end with this being the quiescent state.
 ///
-struct RawEvent(AtomicU8);
+#[doc(hidden)]
+pub struct RawEvent(AtomicU8);
 
 /// A representation of the state of an event, which can either be `Set` (i.e. signalled,
 /// ready) or `Unset` (i.e. not ready).
@@ -66,208 +68,6 @@ pub enum EventState {
     /// The event is unavailable and calls to [`Awaitable::wait()`] will block until the event
     /// becomes set, i.e. the event is unsignalled.
     Unset,
-}
-
-#[doc(hidden)]
-/// This is for backwards compatibility with earlier `rsevents` releases, which used the less
-/// specific (and much more likely to conflict) name `State` instead of `EventState`.
-pub type State = EventState;
-
-/// Generic api for waiting on any type that can be, well, waited on.
-///
-/// This is a unified trait that is used by `rsevents` and downstream dependent crates implementing
-/// synchronization primitives atop of `rsevents` to expose a single interface for waiting on an
-/// object either indefinitely or for a bounded length of time.
-pub trait Awaitable {
-    /// Check for and obtain the awaitable type if it is available; if not, block waiting for it to
-    /// become available.
-    fn wait(&self);
-
-    /// Check for/obtain the awaitable type if it is available, and if not, block for `limit`
-    /// waiting for it to become available.
-    /// Returns `true` if the `Awaitable` was originally set or if it became so within the specified
-    /// duration and `false` otherwise (i.e. if the timeout elapsed without the `Awaitable` type
-    /// becoming set/available).
-    fn wait_for(&self, limit: Duration) -> bool;
-
-    /// Attempt to obtain the `Awaitable` type in a potentially lock-free, wait-free manor,
-    /// returning `false` if it's currently unavailable.
-    /// **This call may have side effects beyond merely returning the current state and must
-    /// not be considered the equivalent of a `test()` or `peek()` function.**
-    ///
-    /// Note that this may not be the same as calling [`Awaitable::wait_for()`] with a `Duration` of
-    /// zero, as the implementing type may use a different approach to ensure that the calling
-    /// thread does not block.
-    fn wait0(&self) -> bool {
-        // The default implementation of this method is to just call `wait_for()` with a zero wait.
-        // The function should be overridden if a better alternative is possible.
-        return self.wait_for(Duration::ZERO);
-    }
-}
-
-/// An `AutoResetEvent` is a gated event that is functionally equivalent to an "awaitable
-/// boolean" and can be atomically waited upon and consumed to signal one and only one waiter at a
-/// time, thereby guaranteeing exclusive signalling. This is not unlike a multi-producer,
-/// multi-consumer non-broadcast `Channel<()>` with a buffer size of 1, except much more efficient
-/// and lightweight.
-///
-/// `AutoResetEvent` can be used to implement other synchronization objects such as mutexes and
-/// condition variables, but it is most appropriate for uses involving signalling between two or
-/// more threads. Unlike a [`ManualResetEvent`], an `AutoResetEvent`'s `set` state is selectively
-/// made visible to only one waiter at a time (including both past waiters currently in a
-/// suspended/parked state and future waiters that haven't yet made a call to `Awaitable::wait()` or
-/// similar).
-///
-/// When [`AutoResetEvent::set()`] is called, at most one thread blocked in a call to
-/// [`Awaitable::wait()`] will be let through: if a previously parked thread was awakened, then the
-/// event's state remains unset for all other past/future callers (until another call to
-/// `AutoResetEvent::set()`), but if no threads were previously parked waiting for this event to be
-/// signalled then only the next thread to call [`AutoResetEvent::wait()`] against this instance
-/// will be let through without blocking. Regardless of whether or not there are any threads
-/// currently waiting, the call to `set()` always returns immediately (i.e. it does not block until
-/// another thread attempts to obtain the event).
-///
-/// Auto-reset events are thread-safe and may be wrapped in an [`Arc`](std::sync::Arc) or declared
-/// as a static global to easily share access across threads.
-pub struct AutoResetEvent {
-    event: RawEvent,
-}
-
-impl AutoResetEvent {
-    /// Create a new [`AutoResetEvent`] that can be used to atomically signal one waiter at a time.
-    pub const fn new(state: EventState) -> AutoResetEvent {
-        Self {
-            event: RawEvent::new(match state {
-                EventState::Set => AVAILABLE_BIT,
-                EventState::Unset => 0,
-            })
-        }
-    }
-
-    /// Triggers the underlying `RawEvent`, either releasing one suspended waiter or allowing one
-    /// future caller to exclusively obtain the event.
-    pub fn set(&self) {
-        self.event.set_one()
-    }
-
-    /// Set the state of the internal event to [`EventState::Unset`], regardless of its current
-    /// status.
-    pub fn reset(&self) {
-        self.event.reset()
-    }
-}
-
-impl Awaitable for AutoResetEvent {
-    /// Check if the event has been signalled, and if not, block waiting for it to be set. When the
-    /// event becomes available to this thread, its state is atomically set to
-    /// [`EventState::Unset`], allowing only this one waiter through until another call to
-    /// [`AutoResetEvent::set()`] is made.
-    fn wait(&self) {
-        self.event.unlock_one()
-    }
-
-    /// Check if the event has been signalled, and if not, block for `limit` waiting for it to be set.
-    /// If and when the event becomes available, its state is atomically set to
-    /// [`EventState::Unset`], allowing only this one waiter through.
-    ///
-    /// Returns `true` if the event was originally set or if it was signalled within the specified
-    /// duration, and `false` otherwise (i.e. the timeout elapsed without the event becoming set).
-    fn wait_for(&self, limit: Duration) -> bool {
-        self.event.wait_one_for(limit)
-    }
-
-    /// "Wait" on the `AutoResetEvent` event without blocking, immediately returning `true` if the
-    /// event was signalled for this thread and `false` if it wasn't set.
-    /// **This is _not_ a `peek()` function:** if the event's state was [`EventState::Set`], it is
-    /// atomically reset to [`EventState::Unset`], locking out all other callers.
-    ///
-    /// Note that this is similar but not identical to calling [`AutoResetEvent::wait_for()`] with a
-    /// `Duration` of zero, as the calling thread never blocks or yields.
-    fn wait0(&self) -> bool {
-        // In case of miri or if testing under ARM, make sure that a top-level wait0() call from
-        // outside the implementation code returns a deterministic result.
-        #[cfg(any(test, miri))]
-        return self.event.test_try_unlock_one();
-        #[cfg(not(any(test, miri)))]
-        return self.event.try_unlock_one();
-    }
-}
-
-/// A `ManualResetEvent` is an event type best understood as an "awaitable boolean" that efficiently
-/// synchronizes thread access to a shared state, allowing one or more threads to wait for a signal
-/// from one or more other threads, where the signal could have either occurred in the past or could
-/// come at any time in the future.
-///
-/// Unlike an [`AutoResetEvent`] which atomically allows one and only one waiter through each time
-/// the underlying `RawEvent` is set, a `ManualResetEvent` unparks all past waiters and allows
-/// all future waiters calling [`Awaitable::wait()`] to continue without blocking (until
-/// [`ManualResetEvent::reset()`] is called).
-///
-/// A `ManualResetEvent` is rarely appropriate for general purpose thread synchronization (à la
-/// condition variables and mutexes), where exclusive access to a protected critical section is
-/// usually desired, as if multiple threads are suspended/parked waiting for the event to be
-/// signalled and then [`ManualResetEvent::set()`] is called, _all_ of the suspended threads will be
-/// unparked and will resume. However, a `ManualResetEvent` shines when it comes to setting
-/// persistent state indicators, such as a globally-shared abort flag.
-///
-/// Manual-reset events are thread-safe and may be wrapped in an [`Arc`](std::sync::Arc) or declared
-/// as a static global to easily share access across threads.
-pub struct ManualResetEvent {
-    event: RawEvent,
-}
-
-impl ManualResetEvent {
-    /// Create a new [`ManualResetEvent`] with the initial [`EventState`] set to `state`.
-    pub const fn new(state: EventState) -> ManualResetEvent {
-        Self {
-            event: RawEvent::new(match state {
-                EventState::Set => AVAILABLE_BIT,
-                EventState::Unset => 0,
-            })
-        }
-    }
-
-    /// Puts the [`ManualResetEvent`] into a set state, releasing all suspended waiters (if any)
-    /// and leaving the event set for future callers to [`ManualResetEvent::wait()`] and co.
-    pub fn set(&self) {
-        self.event.set_all()
-    }
-
-    /// Set the state of the [`ManualResetEvent`] to [`EventState::Unset`], regardless of its
-    /// current state. This will cause future calls to [`ManualResetEvent::wait()`] to block until
-    /// the event is set (via [`ManualResetEvent::set()`]).
-    pub fn reset(&self) {
-        self.event.reset()
-    }
-}
-
-impl Awaitable for ManualResetEvent {
-    /// Check if the underlying event is in a set state or wait for its state to become
-    /// [`EventState::Set`]. In contrast with [`AutoResetEvent::wait()`], the event's state is not
-    /// affected by this operation, i.e. it remains set for future callers even after this function
-    /// call returns, until a call to [`ManualResetEvent::reset()`] is made.
-    fn wait(&self) {
-        self.event.unlock_all()
-    }
-
-    /// Check if the underlying event is in a set state (and return immediately) or wait for it to
-    /// become set, up to the limit specified by the `Duration` parameter.
-    ///
-    /// Returns `true` if the event was initially set or if it became set within the timeout
-    /// specified, otherwise returns `false` if the timeout elapsed without the event becoming
-    /// available.
-    fn wait_for(&self, limit: Duration) -> bool {
-        self.event.wait_all_for(limit)
-    }
-
-    /// Test if an event is available without blocking, returning `false` immediately if it is
-    /// not set.
-    ///
-    /// Note that this is not the same as calling [`ManualResetEvent::wait_for()`] with a `Duration` of
-    /// zero, as the calling thread never yields.
-    fn wait0(&self) -> bool {
-        self.event.try_unlock_all()
-    }
 }
 
 impl RawEvent {
@@ -640,3 +440,349 @@ impl RawEvent {
         }
     }
 }
+
+#[doc(hidden)]
+/// This is for backwards compatibility with earlier `rsevents` releases, which used the less
+/// specific (and much more likely to conflict) name `State` instead of `EventState`.
+pub type State = EventState;
+
+/// The default error returned by types implementing [`Awaitable`], with the only possible error
+/// being a timeout to a bounded `wait()` call.
+///
+/// When `Awaitable<Error = TimeoutError>`, a simpler `Awaitable` api bypassing error handling is
+/// exposed.
+#[derive(Debug, Copy, Clone)]
+pub struct TimeoutError;
+
+impl std::fmt::Display for TimeoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("The wait call timed out")
+    }
+}
+
+impl std::error::Error for TimeoutError {
+}
+
+impl AwaitableError for TimeoutError {
+    type UnboundedError = std::convert::Infallible;
+    // type BoundedError = TimeoutError;
+}
+
+mod sealed {
+    use crate::Awaitable;
+    use crate::AwaitableError;
+
+    pub trait InfallibleUnboundedWait {}
+    impl<E> InfallibleUnboundedWait for E
+        where E: AwaitableError<UnboundedError = std::convert::Infallible>,
+    {
+    }
+
+    pub trait VoidAwaitable {}
+    impl<T,E> VoidAwaitable for T
+        where T: Awaitable<T = (), Error = E>,
+              E: std::error::Error
+    {
+    }
+}
+
+/// Denotes the error returned by an [`Awaitable`] object for its various wait calls, separating
+/// between internal errors preventing the wait from succeeding (e.g. a poison error) and errors due
+/// only to a timeout.
+///
+/// Types implementing `Awaitable<T = (), Error = TimeoutError>` unlock a much simpler `Awaitable`
+/// api for end users, that omits error handling and replaces timeout errors with boolean results.
+pub trait AwaitableError: std::error::Error {
+    /// The error type that may result from a call to an unbounded [`Awaitable::try_wait()`] call
+    /// (i.e. excluding any timeout errors).
+    ///
+    /// Using `std::convert::Infallible` here will unlock a simpler `Awaitable` API for end users,
+    /// with an infallible [`Awaitable::wait()`] becoming available. Typically use `Self` otherwise
+    /// to denote that `wait()` and `wait_for()` return the same error type.
+    type UnboundedError: std::error::Error;
+}
+
+/// The basic interface for waiting on void awaitable types
+///
+/// This is a unified trait that is used by `rsevents` and downstream dependent crates implementing
+/// synchronization primitives atop of `rsevents` to expose a single interface for waiting on an
+/// object either indefinitely or for a bounded length of time.
+///
+/// Types implementing `Awaitable<T = (), Error = TimeoutError>` unlock a much simpler `Awaitable`
+/// api for end users, that omits error handling and replaces timeout errors with boolean results.
+pub trait Awaitable {
+    /// The type yielded by the Awaitable type on a successful wait
+    type T;
+    /// The type yielded by the Awaitable type in case of an error, also specifying whether or not
+    /// an unbounded `Awaitable::wait()` returns any error at all.
+    type Error : AwaitableError;
+
+    /// Waits on the `Awaitable` type, blocking efficiently until it becomes available. Returns the
+    /// awaited type `T` (if it isn't `()`) or an error indicating a wait issue. Does not time out.
+    fn try_wait(&self) -> Result<Self::T, <Self::Error as AwaitableError>::UnboundedError>;
+
+    /// Waits on the `Awaitable` type until it becomes available or the timeout period described by
+    /// `limit` elapses, in which case a timeout error is returned.
+    fn try_wait_for(&self, limit: Duration) -> Result<Self::T, Self::Error>;
+
+    /// Attempt to obtain the `Awaitable` type `T` in a potentially lock-free, wait-free manor,
+    /// returning a timeout error if it is not available.
+    /// **This call may have side effects beyond merely returning the current state and must
+    /// not be considered the equivalent of a `test()` or `peek()` function.**
+    ///
+    /// This function should be overridden by `Awaitable` implementations that can offer a
+    /// streamlined version of `try_wait_for()` for hard-coded zero timeout.
+    fn try_wait0(&self) -> Result<Self::T, Self::Error> {
+        // The default implementation of this method is to just call `wait_for()` with a zero wait.
+        // The function should be overridden if a better alternative is possible.
+        self.try_wait_for(Duration::ZERO)
+    }
+
+    /// Blocks until the `Awaitable` type and its associated type `T` become available. Like
+    /// [`try_wait()`](Self::try_wait) but bypasses error handling.
+    ///
+    /// Only available if the `Awaitable` implementation implements `InfallibleUnboundedWait`, i.e.
+    /// does not return any errors except on timeout.
+    fn wait(&self) -> Self::T
+        where Self::Error: sealed::InfallibleUnboundedWait,
+    {
+        self.try_wait().expect("try_wait() is not allowed to return TimeoutError!")
+    }
+
+    /// Attempts a bounded wait on the the `Awaitable` type.
+    /// Like [`try_wait_for()`](Self::try_wait_for) but returns `true` if the `Awaitable` was
+    /// originally set or if it became so within the specified duration and `false` otherwise.
+    ///
+    /// Only available if `Awaitable::Error` implements `InfallibleUnboundedWait` (i.e. does not
+    /// return any errors except on timeout) and has a void return type `T`.
+    fn wait_for(&self, limit: Duration) -> bool
+        where Self: sealed::VoidAwaitable,
+              Self::Error: sealed::InfallibleUnboundedWait,
+    {
+        match self.try_wait_for(limit) {
+            Ok(_) => true,
+            Err(_) => false,
+        }
+    }
+
+    /// Attempts to obtain the `Awaitable` type `T` in a potentially lock-free, wait-free manner,
+    /// returning a timeout error if it's currently unavailable.
+    /// Like [`try_wait0()`](Self::try_wait0) but returns `true` if the `Awaitable` was
+    /// available and obtained or `false` otherwise.
+    /// **This call may have side effects beyond merely returning the current state and must
+    /// not be considered the equivalent of a `test()` or `peek()` function.**
+    ///
+    /// Note that this may not be the same as calling [`Awaitable::wait_for()`] with a `Duration` of
+    /// zero, as the implementing type may use a different approach to ensure that the calling
+    /// thread does not block.
+    ///
+    /// Only available if `Awaitable:Error` implements `InfallibleUnboundedWait` (i.e. does not
+    /// return any errors except on timeout) and has a void return type `T`.
+    fn wait0(&self) -> bool
+        where Self: sealed::VoidAwaitable,
+              Self::Error: sealed::InfallibleUnboundedWait,
+    {
+        match self.try_wait0() {
+            Ok(_) => true,
+            Err(_) => false,
+        }
+    }
+}
+
+/// An `AutoResetEvent` is a synchronization primitive that is functionally equivalent to an
+/// "awaitable boolean" and can be atomically waited upon and consumed to signal one and only one
+/// waiter at a time, thereby guaranteeing exclusive signalling. This is not unlike a
+/// multi-producer, multi-consumer non-broadcast `Channel<()>` with a buffer size of 1, except much
+/// more efficient and lightweight.
+///
+/// `AutoResetEvent` can be used to implement other synchronization objects such as mutexes and
+/// condition variables, but it is most appropriate for uses involving signalling between two or
+/// more threads. Unlike a [`ManualResetEvent`], an `AutoResetEvent`'s `set` state is selectively
+/// made visible to only one waiter at a time (including both past waiters currently in a
+/// suspended/parked state and future waiters that haven't yet made a call to `Awaitable::wait()` or
+/// similar).
+///
+/// When [`AutoResetEvent::set()`] is called, at most one thread blocked in a call to
+/// [`Awaitable::wait()`] will be let through: if a previously parked thread was awakened, then the
+/// event's state remains unset for all other past/future callers (until another call to
+/// `AutoResetEvent::set()`), but if no threads were previously parked waiting for this event to be
+/// signalled then only the next thread to call [`AutoResetEvent::wait()`] against this instance
+/// will be let through without blocking. Regardless of whether or not there are any threads
+/// currently waiting, the call to `set()` always returns immediately (i.e. it does not block until
+/// another thread attempts to obtain the event).
+///
+/// Auto-reset events are thread-safe and may be wrapped in an [`Arc`](std::sync::Arc) or declared
+/// as a static global to easily share access across threads.
+pub struct AutoResetEvent {
+    event: RawEvent,
+}
+
+impl AutoResetEvent {
+    /// Create a new [`AutoResetEvent`] that can be used to atomically signal one waiter at a time.
+    pub const fn new(state: EventState) -> AutoResetEvent {
+        Self {
+            event: RawEvent::new(match state {
+                EventState::Set => AVAILABLE_BIT,
+                EventState::Unset => 0,
+            })
+        }
+    }
+
+    /// Triggers the underlying `RawEvent`, either releasing one suspended waiter or allowing one
+    /// future caller to exclusively obtain the event.
+    pub fn set(&self) {
+        self.event.set_one()
+    }
+
+    /// Set the state of the internal event to [`EventState::Unset`], regardless of its current
+    /// status.
+    pub fn reset(&self) {
+        self.event.reset()
+    }
+}
+
+impl Awaitable for AutoResetEvent {
+    type T = ();
+    type Error = TimeoutError;
+
+    /// Check if the event has been signalled, and if not, block waiting for it to be set. When the
+    /// event becomes available to this thread, its state is atomically set to
+    /// [`EventState::Unset`], allowing only this one waiter through until another call to
+    /// [`AutoResetEvent::set()`] is made.
+    fn try_wait(&self) -> Result<Self::T, Infallible> {
+        Ok(self.event.unlock_one())
+    }
+
+    /// Check if the event has been signalled, and if not, block for `limit` waiting for it to be set.
+    /// If and when the event becomes available, its state is atomically set to
+    /// [`EventState::Unset`] before this method returns, allowing only this one waiter through.
+    /*///
+    /// Returns `true` if the event was originally set or if it was signalled within the specified
+    /// duration, and `false` otherwise (i.e. the timeout elapsed without the event becoming set).*/
+    fn try_wait_for(&self, limit: Duration) -> Result<(), TimeoutError> {
+        if self.event.wait_one_for(limit) {
+            Ok(())
+        } else {
+            Err(TimeoutError)
+        }
+    }
+
+    /// "Wait" on the `AutoResetEvent` event without blocking, immediately returning `Ok` if the
+    /// event was signalled for this thread and `Err(TimeoutError)` if it wasn't set.
+    /// **This is _not_ a `peek()` function:** if the event's state was [`EventState::Set`], it is
+    /// atomically reset to [`EventState::Unset`], locking out all other waiters.
+    ///
+    /// Note that this is similar but not identical to calling [`AutoResetEvent::try_wait_for()`] with a
+    /// `Duration` of zero, as the calling thread never blocks or yields.
+    /*/// "Wait" on the `AutoResetEvent` event without blocking, immediately returning `true` if the
+    /// event was signalled for this thread and `false` if it wasn't set.
+    /// **This is _not_ a `peek()` function:** if the event's state was [`EventState::Set`], it is
+    /// atomically reset to [`EventState::Unset`], locking out all other callers.
+    ///
+    /// Note that this is similar but not identical to calling [`AutoResetEvent::wait_for()`] with a
+    /// `Duration` of zero, as the calling thread never blocks or yields.*/
+    fn try_wait0(&self) -> Result<(), TimeoutError> {
+        // In case of miri or if testing under ARM, make sure that a top-level wait0() call from
+        // outside the implementation code returns a deterministic result.
+        #[cfg(any(test, miri))]
+        return match self.event.test_try_unlock_one() {
+            true => Ok(()),
+            false => Err(TimeoutError),
+        };
+        #[cfg(not(any(test, miri)))]
+        return match self.event.try_unlock_one() {
+            true => Ok(()),
+            false => Err(TimeoutError),
+        };
+    }
+}
+
+/// A `ManualResetEvent` is an event type best understood as an "awaitable boolean" that efficiently
+/// synchronizes thread access to a shared state, allowing one or more threads to wait for a signal
+/// from one or more other threads, where the signal could have either occurred in the past or could
+/// come at any time in the future.
+///
+/// Unlike an [`AutoResetEvent`] which atomically allows one and only one waiter through each time
+/// the underlying `RawEvent` is set, a `ManualResetEvent` unparks all past waiters and allows
+/// all future waiters calling [`Awaitable::wait()`] to continue without blocking (until
+/// [`ManualResetEvent::reset()`] is called).
+///
+/// A `ManualResetEvent` is rarely appropriate for general purpose thread synchronization (à la
+/// condition variables and mutexes), where exclusive access to a protected critical section is
+/// usually desired, as if multiple threads are suspended/parked waiting for the event to be
+/// signalled and then [`ManualResetEvent::set()`] is called, _all_ of the suspended threads will be
+/// unparked and will resume. However, a `ManualResetEvent` shines when it comes to setting
+/// persistent state indicators, such as a globally-shared abort flag.
+///
+/// Manual-reset events are thread-safe and may be wrapped in an [`Arc`](std::sync::Arc) or declared
+/// as a static global to easily share access across threads.
+pub struct ManualResetEvent {
+    event: RawEvent,
+}
+
+impl ManualResetEvent {
+    /// Create a new [`ManualResetEvent`] with the initial [`EventState`] set to `state`.
+    pub const fn new(state: EventState) -> ManualResetEvent {
+        Self {
+            event: RawEvent::new(match state {
+                EventState::Set => AVAILABLE_BIT,
+                EventState::Unset => 0,
+            })
+        }
+    }
+
+    /// Puts the [`ManualResetEvent`] into a set state, releasing all suspended waiters (if any)
+    /// and leaving the event set for future callers to [`ManualResetEvent::wait()`] and co.
+    pub fn set(&self) {
+        self.event.set_all()
+    }
+
+    /// Set the state of the [`ManualResetEvent`] to [`EventState::Unset`], regardless of its
+    /// current state. This will cause future calls to [`ManualResetEvent::wait()`] to block until
+    /// the event is set (via [`ManualResetEvent::set()`]).
+    pub fn reset(&self) {
+        self.event.reset()
+    }
+}
+
+impl Awaitable for ManualResetEvent {
+    type T = ();
+    type Error = TimeoutError;
+
+    /// Check if the underlying event is in a set state or wait for its state to become
+    /// [`EventState::Set`]. In contrast with [`AutoResetEvent::try_wait()`], the event's state is
+    /// not affected by this operation, i.e. it remains set for future callers even after this
+    /// function call returns (until a call to [`ManualResetEvent::reset()`] is made).
+    fn try_wait(&self) -> Result<(), Infallible> {
+        Ok(self.event.unlock_all())
+    }
+
+    /// Check if the underlying event is in a set state (and return immediately) or wait for it to
+    /// become set, up to the limit specified by the `Duration` parameter.
+    ///
+    /// Returns `Ok(())` if the event was initially set or if it became set within the timeout
+    /// specified, otherwise returns `Err(TimeoutError)` if the timeout elapsed with thet event
+    /// becoming available.
+    /*/// Returns `true` if the event was initially set or if it became set within the timeout
+    /// specified, otherwise returns `false` if the timeout elapsed without the event becoming
+    /// available.*/
+    fn try_wait_for(&self, limit: Duration) -> Result<(), TimeoutError> {
+        match self.event.wait_all_for(limit) {
+            true => Ok(()),
+            false => Err(TimeoutError),
+        }
+    }
+
+    /// Test if an event is available without blocking, returning `Err(TimeoutErr)` immediately if
+    /// it is not set.
+    ///
+    /// Note that this is not the same as calling [`ManualResetEvent::try_wait_for()`] with a
+    /// `Duration` of zero, as the calling thread never yields.
+    fn try_wait0(&self) -> Result<(), TimeoutError> {
+        match self.event.try_unlock_all() {
+            true => Ok(()),
+            false => Err(TimeoutError),
+        }
+    }
+}
+
