@@ -5,13 +5,16 @@
 //! Events come in two different flavors: [`AutoResetEvent`] and [`ManualResetEvent`]. Internally,
 //! both are implemented with the unsafe `RawEvent` and use the `parking_lot_core` crate to take
 //! care of efficiently suspending (parking) threads while they wait for an event to become
-//! signalled.
+//! signalled, and take care of memory coherence issues between the signalling and signalled
+//! threads.
 //!
-//! An event is a synchronization primitive that is functionally the equivalent of an (optionally
-//! gated) waitable boolean that allows for synchronization between threads. Unlike mutexes and
-//! condition variables which are most often used to restrict access to a critical section, events
-//! are more appropriate for efficiently signalling remote threads or waiting on a remote thread to
-//! change state.
+//! An event is a synchronization primitive that is functionally the equivalent of an awaitable
+//! boolean that allows for synchronization between threads. Unlike mutexes and condition variables
+//! which are most often used to restrict access to a critical section, events are more appropriate
+//! for efficiently signalling remote threads or waiting on a remote thread to change state - or for
+//! building your own synchronization types on top of something both light and easy to use.
+
+#![forbid(missing_docs)]
 
 use parking_lot_core as plc;
 use parking_lot_core::ParkResult;
@@ -70,6 +73,11 @@ pub enum EventState {
 /// specific (and much more likely to conflict) name `State` instead of `EventState`.
 pub type State = EventState;
 
+/// Generic api for waiting on any type that can be, well, waited on.
+///
+/// This is a unified trait that is used by `rsevents` and downstream dependent crates implementing
+/// synchronization primitives atop of `rsevents` to expose a single interface for waiting on an
+/// object either indefinitely or for a bounded length of time.
 pub trait Awaitable {
     /// Check for and obtain the awaitable type if it is available; if not, block waiting for it to
     /// become available.
