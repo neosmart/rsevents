@@ -1,13 +1,14 @@
 [package]
 name = "rsevents"
-description = "Manual and auto reset events for signaling remote threads and building synchronization primitives"
-version = "0.2.1"
+description = "Manual and auto reset events for signaling threads and building new synchronization primitives like semaphores."
+version = "0.3.0"
 authors = ["Mahmoud Al-Qudsi <mqudsi@neosmart.net>",
 		"NeoSmart Technologies <https://neosmart.net/>"]
 homepage = "https://github.com/neosmart/rsevents"
 repository = "https://github.com/neosmart/rsevents"
+documentation = "https://docs.rs/rsevents/latest/rsevents/"
 readme = "README.md"
-keywords = ["synchronization", "events", "signals", "win32"]
+keywords = ["synchronization", "events", "signals", "win32", "futex"]
 categories = ["concurrency", "asynchronous"]
 license = "MIT"
 edition = "2018"
