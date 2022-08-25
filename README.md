@@ -1,7 +1,7 @@
 # rsevents
 
 [![crates.io](https://img.shields.io/crates/v/rsevents.svg)](https://crates.io/crates/rsevents)
-[![docs.rs](https://docs.rs/rsevents/badge.svg)](https://docs.rs/latest/rsevents)
+[![docs.rs](https://docs.rs/rsevents/badge.svg)](https://docs.rs/rsevents/latest/rsevents/)
 
 This crate contains a cross-platform implementation of auto and manual reset events similar to those found in Microsoft Windows, implemented on top of the core parking lot crate as a cross-platform futex abstraction.
 
