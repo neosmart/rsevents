@@ -130,8 +130,7 @@ impl RawEvent {
                         continue;
                     }
                 }
-            }
-            else if (state & WAITING_BIT) == 0 {
+            } else if (state & WAITING_BIT) == 0 {
                 // There are no other threads waiting, so we need to set the WAITING bit ourselves
                 // before we try to park the thread.
                 match self.0.compare_exchange_weak(state, state | WAITING_BIT, Ordering::Relaxed, Ordering::Relaxed) {
@@ -465,7 +464,12 @@ impl std::error::Error for TimeoutError {
 
 impl AwaitableError for TimeoutError {
     type UnboundedError = std::convert::Infallible;
-    // type BoundedError = TimeoutError;
+}
+
+impl std::convert::From<Infallible> for TimeoutError {
+    fn from(_: Infallible) -> Self {
+        unsafe { core::hint::unreachable_unchecked() }
+    }
 }
 
 mod sealed {
