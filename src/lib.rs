@@ -569,10 +569,11 @@ pub trait Awaitable {
         }
     }
 
-    /// Attempts to obtain the `Awaitable` type `T` in a potentially lock-free, wait-free manner,
-    /// returning a timeout error if it's currently unavailable.
+    /// Attempts to obtain the `Awaitable` in a potentially lock-free, wait-free manner, returning a
+    /// timeout error if it's currently unavailable.
     /// Like [`try_wait0()`](Self::try_wait0) but returns `true` if the `Awaitable` was
     /// available and obtained or `false` otherwise.
+    ///
     /// **This call may have side effects beyond merely returning the current state and must
     /// not be considered the equivalent of a `test()` or `peek()` function.**
     ///
