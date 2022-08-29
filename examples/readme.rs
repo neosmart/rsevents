@@ -1,8 +1,8 @@
-/// This example illustrates the use of [`AutoResetEvent`] to dispatch work to
-/// one worker at a time from a thread pool, with the events guaranteeing memory
-/// consistency, efficient wait, wait-with-timeout, and exclusive dispatch.
-///
-/// [`AutoResetEvent`]: rsevents::AutoResetEvent
+//! This example illustrates the use of [`AutoResetEvent`] to dispatch work to
+//! one worker at a time from a thread pool, with the events guaranteeing memory
+//! consistency, efficient wait, wait-with-timeout, and exclusive dispatch.
+//!
+//! [`AutoResetEvent`]: rsevents::AutoResetEvent
 
 use std::time::Duration;
 use rsevents::{Awaitable, AutoResetEvent, EventState};
