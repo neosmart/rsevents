@@ -484,7 +484,7 @@ mod sealed {
 
     pub trait VoidAwaitable {}
     impl<T,E> VoidAwaitable for T
-        where T: Awaitable<T = (), Error = E>,
+        where T: for <'a> Awaitable<'a, T = (), Error = E>,
               E: std::error::Error
     {
     }
@@ -503,6 +503,9 @@ pub trait AwaitableError: std::error::Error {
     /// Using `std::convert::Infallible` here will unlock a simpler `Awaitable` API for end users,
     /// with an infallible [`Awaitable::wait()`] becoming available. Typically use `Self` otherwise
     /// to denote that `wait()` and `wait_for()` return the same error type.
+    ///
+    /// It is recommended - but not required - to implement or otherwise satisfy the constraint
+    /// `From<E::UnboundedError>` for `E` where `E` implements `AwaitableError`.
     type UnboundedError: std::error::Error;
 }
 
@@ -514,7 +517,7 @@ pub trait AwaitableError: std::error::Error {
 ///
 /// Types implementing `Awaitable<T = (), Error = TimeoutError>` unlock a much simpler `Awaitable`
 /// api for end users, that omits error handling and replaces timeout errors with boolean results.
-pub trait Awaitable {
+pub trait Awaitable<'a> {
     /// The type yielded by the Awaitable type on a successful wait
     type T;
     /// The type yielded by the Awaitable type in case of an error, also specifying whether or not
@@ -523,11 +526,11 @@ pub trait Awaitable {
 
     /// Waits on the `Awaitable` type, blocking efficiently until it becomes available. Returns the
     /// awaited type `T` (if it isn't `()`) or an error indicating a wait issue. Does not time out.
-    fn try_wait(&self) -> Result<Self::T, <Self::Error as AwaitableError>::UnboundedError>;
+    fn try_wait(&'a self) -> Result<Self::T, <Self::Error as AwaitableError>::UnboundedError>;
 
     /// Waits on the `Awaitable` type until it becomes available or the timeout period described by
     /// `limit` elapses, in which case a timeout error is returned.
-    fn try_wait_for(&self, limit: Duration) -> Result<Self::T, Self::Error>;
+    fn try_wait_for(&'a self, limit: Duration) -> Result<Self::T, Self::Error>;
 
     /// Attempt to obtain the `Awaitable` type `T` in a potentially lock-free, wait-free manor,
     /// returning a timeout error if it is not available.
@@ -536,7 +539,7 @@ pub trait Awaitable {
     ///
     /// This function should be overridden by `Awaitable` implementations that can offer a
     /// streamlined version of `try_wait_for()` for hard-coded zero timeout.
-    fn try_wait0(&self) -> Result<Self::T, Self::Error> {
+    fn try_wait0(&'a self) -> Result<Self::T, Self::Error> {
         // The default implementation of this method is to just call `wait_for()` with a zero wait.
         // The function should be overridden if a better alternative is possible.
         self.try_wait_for(Duration::ZERO)
@@ -547,19 +550,19 @@ pub trait Awaitable {
     ///
     /// Only available if the `Awaitable` implementation implements `InfallibleUnboundedWait`, i.e.
     /// does not return any errors except on timeout.
-    fn wait(&self) -> Self::T
+    fn wait(&'a self) -> Self::T
         where Self::Error: sealed::InfallibleUnboundedWait,
     {
         self.try_wait().expect("try_wait() is not allowed to return TimeoutError!")
     }
 
-    /// Attempts a bounded wait on the the `Awaitable` type.
-    /// Like [`try_wait_for()`](Self::try_wait_for) but returns `true` if the `Awaitable` was
-    /// originally set or if it became so within the specified duration and `false` otherwise.
+    /// Attempts a bounded wait on the the `Awaitable` type. Like
+    /// [`try_wait_for()`](Self::try_wait_for) but returns `true` if the `Awaitable` was originally
+    /// available or if it became so within the specified duration and `false` otherwise.
     ///
     /// Only available if `Awaitable::Error` implements `InfallibleUnboundedWait` (i.e. does not
     /// return any errors except on timeout) and has a void return type `T`.
-    fn wait_for(&self, limit: Duration) -> bool
+    fn wait_for(&'a self, limit: Duration) -> bool
         where Self: sealed::VoidAwaitable,
               Self::Error: sealed::InfallibleUnboundedWait,
     {
@@ -583,7 +586,7 @@ pub trait Awaitable {
     ///
     /// Only available if `Awaitable:Error` implements `InfallibleUnboundedWait` (i.e. does not
     /// return any errors except on timeout) and has a void return type `T`.
-    fn wait0(&self) -> bool
+    fn wait0(&'a self) -> bool
         where Self: sealed::VoidAwaitable,
               Self::Error: sealed::InfallibleUnboundedWait,
     {
@@ -646,7 +649,7 @@ impl AutoResetEvent {
     }
 }
 
-impl Awaitable for AutoResetEvent {
+impl Awaitable<'_> for AutoResetEvent {
     type T = ();
     type Error = TimeoutError;
 
@@ -750,7 +753,7 @@ impl ManualResetEvent {
     }
 }
 
-impl Awaitable for ManualResetEvent {
+impl Awaitable<'_> for ManualResetEvent {
     type T = ();
     type Error = TimeoutError;
 
