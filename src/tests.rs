@@ -165,7 +165,9 @@ fn auto_reset_cache_coherence() {
             if !EVENT1.wait_for(Duration::from_secs_f32(1.5)) {
                 panic!("Worker thread {} timed out waiting for EVENT1", i);
             }
-            unsafe { SUCCEED_COUNT += 1; }
+            unsafe {
+                SUCCEED_COUNT += 1;
+            }
             // Allow another thread in
             EVENT2.set();
             // eprintln!("Worker thread {} set EVENT2", i);
@@ -182,9 +184,7 @@ fn auto_reset_cache_coherence() {
             let mut rng = Rng::from_seed(i as u64);
             join_handles.push(create_waiter(i));
             thread::sleep(Duration::from_micros(rng.rand_range_u64(0, 300)));
-            // for _ in 0..i*4 {
-                std::thread::yield_now();
-            // }
+            std::thread::yield_now();
         }
         // eprintln!("Spawned {} threads", THREAD_COUNT);
 

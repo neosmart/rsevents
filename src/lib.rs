@@ -119,7 +119,9 @@ impl RawEvent {
             if (state & AVAILABLE_BIT) != 0 {
                 // The lock is available; try to obtain it even if the WAITING bit is set by
                 // another thread.
-                match self.0.compare_exchange_weak(state, state & !AVAILABLE_BIT, Ordering::Acquire, Ordering::Relaxed) {
+                match self.0.compare_exchange_weak(
+                    state, state & !AVAILABLE_BIT, Ordering::Acquire, Ordering::Relaxed,
+                ) {
                     Ok(_) => {
                         // The lock was obtained; there may or may not be other threads suspended.
                         return true;
@@ -133,11 +135,13 @@ impl RawEvent {
             } else if (state & WAITING_BIT) == 0 {
                 // There are no other threads waiting, so we need to set the WAITING bit ourselves
                 // before we try to park the thread.
-                match self.0.compare_exchange_weak(state, state | WAITING_BIT, Ordering::Relaxed, Ordering::Relaxed) {
+                match self.0.compare_exchange_weak(
+                    state, state | WAITING_BIT, Ordering::Relaxed, Ordering::Relaxed,
+                ) {
                     Ok(_) => {
                         // We set the WAITING bit and can continue with attempting to park this
                         // thread.
-                    },
+                    }
                     Err(s) => {
                         // Another thread contended with this call, loop to try again.
                         state = s;
@@ -204,15 +208,16 @@ impl RawEvent {
                 // The event has become available. We can return right away; we don't care about
                 // anything else.
                 return true;
-            }
-            else if (state & WAITING_BIT) == 0 {
+            } else if (state & WAITING_BIT) == 0 {
                 // There are no other threads waiting, so we need to set the WAITING bit ourselves
                 // before we try to park the thread.
-                match self.0.compare_exchange_weak(state, state | WAITING_BIT, Ordering::Relaxed, Ordering::Relaxed) {
+                match self.0.compare_exchange_weak(
+                    state, state | WAITING_BIT, Ordering::Relaxed, Ordering::Relaxed,
+                ) {
                     Ok(_) => {
                         // We set the WAITING bit without contention and can move on to trying to
                         // park this thread.
-                    },
+                    }
                     Err(s) => {
                         // Another thread contended with this call, loop to try again.
                         state = s;
@@ -272,7 +277,9 @@ impl RawEvent {
         // Optimize for cases where the event wasn't available and isn't under any contention.
         // NOTE: This makes calling set() on an already set event more expensive. This match block
         // can be replaced with `self.0.load(Ordering::Relaxed)` to bypass this optimization.
-        let mut state = match self.0.compare_exchange(0, AVAILABLE_BIT, Ordering::Release, Ordering::Relaxed) {
+        let mut state = match self.0.compare_exchange(
+            0, AVAILABLE_BIT, Ordering::Release, Ordering::Relaxed,
+        ) {
             Ok(_) => return,
             Err(s) => s,
         };
@@ -282,16 +289,18 @@ impl RawEvent {
                 0b00 => {
                     // There are no parked/suspended threads so we are able to "fast set" the event
                     // without worrying about synchronizing with threads parked or about to park.
-                    match self.0.compare_exchange_weak(0, AVAILABLE_BIT, Ordering::Release, Ordering::Relaxed) {
+                    match self.0.compare_exchange_weak(
+                        0, AVAILABLE_BIT, Ordering::Release, Ordering::Relaxed,
+                    ) {
                         Ok(_) => return,
                         Err(s) => {
                             // We raced with a thread trying to park or another call to set(). Loop
                             // to figure out what happened.
                             state = s;
                             continue;
-                        },
+                        }
                     }
-                },
+                }
                 0b01 => {
                     // This was a call to set_one() on an event that was already set; we don't need to
                     // "do" anything but we need to touch the shared memory location to ensure
@@ -303,19 +312,21 @@ impl RawEvent {
                     // that there will ever be any more set() calls afterwards, meaning whatever was
                     // written by the thread making the second set() call may never wind up being
                     // observed by a thread that fast-obtains the event in a wait() call.
-                    match self.0.compare_exchange_weak(state, state, Ordering::Release, Ordering::Relaxed) {
+                    match self.0.compare_exchange_weak(
+                        state, state, Ordering::Release, Ordering::Relaxed,
+                    ) {
                         Ok(_) => return,
                         Err(s) => {
                             state = s;
                             continue;
-                        },
+                        }
                     }
-                },
+                }
                 0b10 => {
                     // A thread is waiting to obtain this event, so we can't fast set it and must
                     // instead go through the plc queue lock.
                     break;
-                },
+                }
                 0b11 => {
                     // This shouldn't happen but it's hard to guarantee because of the interplay
                     // between concurrent `set_one()` calls at the same time as a `suspend_one()`
@@ -323,11 +334,11 @@ impl RawEvent {
                     #[cfg(any(test, miri))]
                     assert!(false, "AVAILABLE and WAITING bits set!");
                     break;
-                },
+                }
                 _ => {
                     // We only use the lowest two bits of the AtomicU8 state
                     unsafe { core::hint::unreachable_unchecked() }
-                },
+                }
             }
         }
 
@@ -424,9 +435,7 @@ impl RawEvent {
             return true;
         }
 
-        unsafe {
-            self.suspend_one(Some(limit))
-        }
+        unsafe {self.suspend_one(Some(limit)) }
     }
 
     fn wait_all_for(&self, limit: Duration) -> bool {
@@ -434,9 +443,7 @@ impl RawEvent {
             return true;
         }
 
-        unsafe {
-            self.suspend_all(Some(limit))
-        }
+        unsafe { self.suspend_all(Some(limit)) }
     }
 }
 
@@ -459,8 +466,7 @@ impl std::fmt::Display for TimeoutError {
     }
 }
 
-impl std::error::Error for TimeoutError {
-}
+impl std::error::Error for TimeoutError {}
 
 impl AwaitableError for TimeoutError {
     type UnboundedError = std::convert::Infallible;
@@ -473,19 +479,19 @@ impl std::convert::From<Infallible> for TimeoutError {
 }
 
 mod sealed {
-    use crate::Awaitable;
-    use crate::AwaitableError;
+    use crate::{Awaitable, AwaitableError};
 
     pub trait InfallibleUnboundedWait {}
-    impl<E> InfallibleUnboundedWait for E
-        where E: AwaitableError<UnboundedError = std::convert::Infallible>,
+    impl<E> InfallibleUnboundedWait for E where
+        E: AwaitableError<UnboundedError = std::convert::Infallible>
     {
     }
 
     pub trait VoidAwaitable {}
-    impl<T,E> VoidAwaitable for T
-        where T: for <'a> Awaitable<'a, T = (), Error = E>,
-              E: std::error::Error
+    impl<T, E> VoidAwaitable for T
+    where
+        T: for<'a> Awaitable<'a, T = (), Error = E>,
+        E: std::error::Error,
     {
     }
 }
@@ -522,7 +528,7 @@ pub trait Awaitable<'a> {
     type T;
     /// The type yielded by the Awaitable type in case of an error, also specifying whether or not
     /// an unbounded `Awaitable::wait()` returns any error at all.
-    type Error : AwaitableError;
+    type Error: AwaitableError;
 
     /// Waits on the `Awaitable` type, blocking efficiently until it becomes available. Returns the
     /// awaited type `T` (if it isn't `()`) or an error indicating a wait issue. Does not time out.
@@ -551,9 +557,11 @@ pub trait Awaitable<'a> {
     /// Only available if the `Awaitable` implementation implements `InfallibleUnboundedWait`, i.e.
     /// does not return any errors except on timeout.
     fn wait(&'a self) -> Self::T
-        where Self::Error: sealed::InfallibleUnboundedWait,
+    where
+        Self::Error: sealed::InfallibleUnboundedWait,
     {
-        self.try_wait().expect("try_wait() is not allowed to return TimeoutError!")
+        self.try_wait()
+            .expect("try_wait() is not allowed to return TimeoutError!")
     }
 
     /// Attempts a bounded wait on the the `Awaitable` type. Like
@@ -563,8 +571,9 @@ pub trait Awaitable<'a> {
     /// Only available if `Awaitable::Error` implements `InfallibleUnboundedWait` (i.e. does not
     /// return any errors except on timeout) and has a void return type `T`.
     fn wait_for(&'a self, limit: Duration) -> bool
-        where Self: sealed::VoidAwaitable,
-              Self::Error: sealed::InfallibleUnboundedWait,
+    where
+        Self: sealed::VoidAwaitable,
+        Self::Error: sealed::InfallibleUnboundedWait,
     {
         match self.try_wait_for(limit) {
             Ok(_) => true,
@@ -587,8 +596,9 @@ pub trait Awaitable<'a> {
     /// Only available if `Awaitable:Error` implements `InfallibleUnboundedWait` (i.e. does not
     /// return any errors except on timeout) and has a void return type `T`.
     fn wait0(&'a self) -> bool
-        where Self: sealed::VoidAwaitable,
-              Self::Error: sealed::InfallibleUnboundedWait,
+    where
+        Self: sealed::VoidAwaitable,
+        Self::Error: sealed::InfallibleUnboundedWait,
     {
         match self.try_wait0() {
             Ok(_) => true,
@@ -632,7 +642,7 @@ impl AutoResetEvent {
             event: RawEvent::new(match state {
                 EventState::Set => AVAILABLE_BIT,
                 EventState::Unset => 0,
-            })
+            }),
         }
     }
 
@@ -735,7 +745,7 @@ impl ManualResetEvent {
             event: RawEvent::new(match state {
                 EventState::Set => AVAILABLE_BIT,
                 EventState::Unset => 0,
-            })
+            }),
         }
     }
 
@@ -793,4 +803,3 @@ impl Awaitable<'_> for ManualResetEvent {
         }
     }
 }
-

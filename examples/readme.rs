@@ -4,8 +4,8 @@
 //!
 //! [`AutoResetEvent`]: rsevents::AutoResetEvent
 
+use rsevents::{AutoResetEvent, Awaitable, EventState};
 use std::time::Duration;
-use rsevents::{Awaitable, AutoResetEvent, EventState};
 
 #[derive(Clone, Copy, Debug)]
 enum ThreadMessage {
@@ -48,10 +48,12 @@ pub fn main() {
                 DISPATCHED.set();
 
                 match work_msg {
-                    ThreadMessage::None =>
-                        unreachable!("The AutoResetEvent guarantees against this"),
-                    ThreadMessage::Input(value) =>
-                        eprintln!("Thread {thread_idx} handling value {value}"),
+                    ThreadMessage::None => {
+                        unreachable!("The AutoResetEvent guarantees against this")
+                    }
+                    ThreadMessage::Input(value) => {
+                        eprintln!("Thread {thread_idx} handling value {value}")
+                    }
                 }
             }
         });
@@ -67,7 +69,7 @@ pub fn main() {
             // AutoResetEvents wake one thread at a time) and take care of
             // synchronizing the memory plus any cache coherence issues between
             // the writing thread (this one) and the reading worker thread.
-            *(&mut SHARED as * mut _) = ThreadMessage::Input(value);
+            *(&mut SHARED as *mut _) = ThreadMessage::Input(value);
         }
 
         // Signal a currently idle or the next idle worker thread to handle this
