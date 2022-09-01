@@ -515,7 +515,7 @@ pub trait AwaitableError: std::error::Error {
     type UnboundedError: std::error::Error;
 }
 
-/// The basic interface for waiting on void awaitable types
+/// The shared interface allowing bounded or unbounded waits on types (that possibly yield results).
 ///
 /// This is a unified trait that is used by `rsevents` and downstream dependent crates implementing
 /// synchronization primitives atop of `rsevents` to expose a single interface for waiting on an
